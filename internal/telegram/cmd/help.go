@@ -147,7 +147,8 @@ var (
 		"  Search for music tracks in the database library.\n\n" +
 		"• <code>/mediainfo</code> or <code>/mi</code>\n" +
 		"  Inspect technical metadata, audio codec, bitrate, and tags (send with media or in reply).\n\n" +
-		"• <code>/spec</code>Spec of file.\n" +
+		"• <code>/spec</code>\n" +
+		"  Generate a spectrogram for the uploaded audio file.\n" +
 		"• <code>/help</code>\n" +
 		"  Display this interactive help menu."
 

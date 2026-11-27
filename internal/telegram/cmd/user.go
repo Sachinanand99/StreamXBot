@@ -335,7 +335,7 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		fileName = "audio"
 	}
 
-	analysisCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	analysisCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
 	parseFloat := func(raw string) (float64, bool) {
@@ -348,6 +348,15 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 			return 0, false
 		}
 		return v, true
+	}
+	normalizeKey := func(raw string) string {
+		var key strings.Builder
+		for _, r := range strings.ToLower(strings.TrimSpace(raw)) {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+				key.WriteRune(r)
+			}
+		}
+		return key.String()
 	}
 	fmtRate := func(v float64) string {
 		if v <= 0 {
@@ -429,6 +438,7 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 
 	var probe ffprobeData
 	stats := map[string]float64{}
+	soxStats := map[string]float64{}
 	if audioPath != "" {
 		if out, err := exec.CommandContext(analysisCtx, "ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", audioPath).Output(); err == nil {
 			_ = json.Unmarshal(out, &probe)
@@ -449,11 +459,38 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 				stats[key] = value
 			}
 		}
+
+		if out, err := exec.CommandContext(analysisCtx, "sox", audioPath, "-n", "stat").CombinedOutput(); err == nil {
+			for _, line := range strings.Split(string(out), "\n") {
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) != 2 {
+					continue
+				}
+				key := normalizeKey(parts[0])
+				if key == "" {
+					continue
+				}
+				if _, exists := soxStats[key]; exists {
+					continue
+				}
+				if value, ok := parseFloat(parts[1]); ok {
+					soxStats[key] = value
+				}
+			}
+		}
 	}
 
-	stat := func(scope, suffix string) (float64, bool) {
+	stat := func(parts ...string) (float64, bool) {
 		for key, value := range stats {
-			if strings.Contains(key, "."+scope+".") && strings.HasSuffix(key, "."+suffix) {
+			normalized := normalizeKey(key)
+			matched := true
+			for _, part := range parts {
+				if !strings.Contains(normalized, normalizeKey(part)) {
+					matched = false
+					break
+				}
+			}
+			if matched {
 				return value, true
 			}
 		}
@@ -470,15 +507,7 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		tags[key] = strings.TrimSpace(value)
 	}
 
-	tagKey := func(raw string) string {
-		var key strings.Builder
-		for _, r := range strings.ToLower(strings.TrimSpace(raw)) {
-			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-				key.WriteRune(r)
-			}
-		}
-		return key.String()
-	}
+	tagKey := normalizeKey
 	tagValue := func(names ...string) string {
 		for _, name := range names {
 			wanted := tagKey(name)
@@ -517,6 +546,9 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 			lengthSeconds = v
 		}
 	}
+	if v, ok := soxStats["lengthseconds"]; ok && v > 0 {
+		lengthSeconds = v
+	}
 
 	channels := 0
 	bits := 0
@@ -532,6 +564,11 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		bits = s.BitsPerSample
 		if v, ok := parseFloat(s.BitsPerRawSample); ok && v > 0 {
 			bits = int(v)
+		}
+	}
+	if bits == 0 {
+		if value, ok := stat("bitdepth"); ok && value > 0 {
+			bits = int(value)
 		}
 	}
 
@@ -550,24 +587,17 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		metaArtist = artist
 	}
 
-	comments := tagValue("comment", "comments")
-	commentHttps := tagValue("commenthttps", "commenthttpsurl", "comment url", "applemusicurl")
-	if commentHttps == "" {
+	comments := tagValue("commenthttps", "commenthttpsurl", "comment url", "applemusicurl")
+	if comments == "" {
 		for key, value := range tags {
 			normalizedKey := tagKey(key)
 			lowerValue := strings.ToLower(value)
 			if strings.Contains(normalizedKey, "comment") &&
 				(strings.Contains(normalizedKey, "https") || strings.HasPrefix(lowerValue, "http") || strings.HasPrefix(lowerValue, "//")) {
-				commentHttps = value
+				comments = value
 				break
 			}
 		}
-	}
-	if lowerComments := strings.ToLower(comments); strings.HasPrefix(lowerComments, "http") || strings.HasPrefix(lowerComments, "//") {
-		if commentHttps == "" {
-			commentHttps = comments
-		}
-		comments = ""
 	}
 
 	bpm := ""
@@ -614,29 +644,36 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		channelsText = strconv.Itoa(channels)
 	}
 	writeLine("channels", channelsText)
-	writeLine("commentHttps", commentHttps)
 	writeLine("comments", comments)
 	writeLine("fileSize", fmtSize(fileSize))
 	writeLine("lengthSeconds", fmt.Sprintf("%.6f", lengthSeconds))
 
-	putStat := func(label, scope, suffix string, digits int) {
+	putSoxStat := func(label, key string, digits int) {
 		valueText := ""
-		if value, ok := stat(scope, suffix); ok {
+		if value, ok := soxStats[key]; ok {
 			valueText = fmt.Sprintf("%.*f", digits, value)
 		}
 		writeLine(label, valueText)
 	}
-	putStat("maximumAmplitude", "Overall", "Max_level", 6)
-	putStat("maximumDelta", "Difference", "Max_level", 6)
-	putStat("meanAmplitude", "Overall", "Mean_level", 6)
-	putStat("meanDelta", "Difference", "Mean_level", 6)
-	putStat("meanNorm", "Overall", "Flat_factor", 6)
-	putStat("midlineAmplitude", "Overall", "DC_offset", 6)
-	putStat("minimumAmplitude", "Overall", "Min_level", 6)
-	putStat("minimumDelta", "Difference", "Min_level", 6)
-	putStat("rmsAmplitude", "Overall", "RMS_level", 6)
-	putStat("rmsDelta", "Difference", "RMS_level", 6)
-	putStat("roughFrequency", "Overall", "Zero_crossings_rate", 0)
+	putStat := func(label string, digits int, parts ...string) {
+		valueText := ""
+		if value, ok := stat(parts...); ok {
+			valueText = fmt.Sprintf("%.*f", digits, value)
+		}
+		writeLine(label, valueText)
+	}
+
+	putSoxStat("maximumAmplitude", "maximumamplitude", 6)
+	putSoxStat("maximumDelta", "maximumdelta", 6)
+	putSoxStat("meanAmplitude", "meanamplitude", 6)
+	putSoxStat("meanDelta", "meandelta", 6)
+	putStat("meanNorm", 6, "overall", "flatfactor")
+	putSoxStat("midlineAmplitude", "midlineamplitude", 6)
+	putSoxStat("minimumAmplitude", "minimumamplitude", 6)
+	putSoxStat("minimumDelta", "minimumdelta", 6)
+	putSoxStat("rmsAmplitude", "rmsamplitude", 6)
+	putSoxStat("rmsDelta", "rmsdelta", 6)
+	putSoxStat("roughFrequency", "roughfrequency", 0)
 
 	precisionText := ""
 	if bits > 0 {
@@ -659,19 +696,9 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		sampleRateText = fmt.Sprintf("%.0f", sampleRate)
 	}
 	writeLine("sampleRate", sampleRateText)
-	putStat("samplesRead", "Overall", "Number_of_samples", 0)
-
-	scaledByText := ""
-	if value, ok := stat("Overall", "Scaled_by"); ok {
-		scaledByText = fmt.Sprintf("%.1f", value)
-	}
-	writeLine("scaledBy", scaledByText)
-
-	volumeAdjustmentText := ""
-	if value, ok := stat("Overall", "Volume_adjustment"); ok {
-		volumeAdjustmentText = fmt.Sprintf("%.3f", value)
-	}
-	writeLine("volumeAdjustment", volumeAdjustmentText)
+	putSoxStat("samplesRead", "samplesread", 0)
+	putSoxStat("scaledBy", "scaledby", 1)
+	putSoxStat("volumeAdjustment", "volumeadjustment", 3)
 
 	_ = h.replyHTML(ctx, e, upd, sb.String(), nil)
 
