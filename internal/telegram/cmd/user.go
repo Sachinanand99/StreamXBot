@@ -934,6 +934,18 @@ func (h *Handler) handleSpectrogram(ctx context.Context, e tg.Entities, upd mess
 		}
 	}
 
+	formatSpecError := func(output []byte, err error) string {
+		text := strings.TrimSpace(string(output))
+		if text == "" && err != nil {
+			text = err.Error()
+		}
+		text = strings.Join(strings.Fields(text), " ")
+		if runes := []rune(text); len(runes) > 500 {
+			text = string(runes[:500]) + "..."
+		}
+		return text
+	}
+
 	if audioPath == "" {
 		_ = h.replyHTML(ctx, e, upd, "Unable to download the audio for the spectrogram.", nil)
 	} else if spec, err := os.CreateTemp("", "streamgo_spec_*.png"); err == nil {
@@ -944,13 +956,55 @@ func (h *Handler) handleSpectrogram(ctx context.Context, e tg.Entities, upd mess
 		if output, err := cmd.CombinedOutput(); err != nil {
 			_ = os.Remove(spectrogramPath)
 			spectrogramPath = ""
-			spectrogramErrText = strings.TrimSpace(string(output))
-			if spectrogramErrText == "" {
-				spectrogramErrText = err.Error()
+			spectrogramErrText = formatSpecError(output, err)
+		}
+	}
+
+	if audioPath != "" && spectrogramPath == "" {
+		soxErrText := spectrogramErrText
+		nyquist := 24000
+		if out, err := exec.CommandContext(analysisCtx, "ffprobe", "-v", "error", "-select_streams", "a:0",
+			"-show_entries", "stream=sample_rate", "-of", "csv=p=0", audioPath).Output(); err == nil {
+			sampleRate := 0
+			if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &sampleRate); err == nil && sampleRate > 1 {
+				nyquist = sampleRate / 2
 			}
-			spectrogramErrText = strings.Join(strings.Fields(spectrogramErrText), " ")
-			if runes := []rune(spectrogramErrText); len(runes) > 500 {
-				spectrogramErrText = string(runes[:500]) + "..."
+		}
+
+		const fitHeight = 720
+		steps := []int{500, 1000, 2000, 4000, 5000, 10000, 20000, 50000, 100000}
+		height := 0
+		for _, stepHz := range steps {
+			candidate := (nyquist*40+stepHz/2)/stepHz + 1
+			if candidate <= fitHeight {
+				height = candidate
+				break
+			}
+		}
+		if height == 0 {
+			height = fitHeight
+		}
+
+		if spec, err := os.CreateTemp("", "streamgo_spec_ffmpeg_*.png"); err == nil {
+			spectrogramPath = spec.Name()
+			_ = spec.Close()
+			_ = os.Remove(spectrogramPath)
+			filter := fmt.Sprintf("showspectrumpic=s=1280x%d:legend=1:mode=combined:fscale=lin:scale=log:start=0:stop=%d", height, nyquist)
+			cmd := exec.CommandContext(analysisCtx, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+				"-i", audioPath, "-lavfi", filter, spectrogramPath)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				_ = os.Remove(spectrogramPath)
+				spectrogramPath = ""
+				fallbackErrText := formatSpecError(output, err)
+				switch {
+				case soxErrText != "" && fallbackErrText != "":
+					combinedErrText := "sox: " + soxErrText + " | ffmpeg: " + fallbackErrText
+					spectrogramErrText = formatSpecError([]byte(combinedErrText), nil)
+				case fallbackErrText != "":
+					spectrogramErrText = "ffmpeg: " + fallbackErrText
+				}
+			} else {
+				spectrogramErrText = ""
 			}
 		}
 	}
