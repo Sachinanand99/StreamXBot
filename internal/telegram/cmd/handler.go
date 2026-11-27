@@ -253,7 +253,7 @@ func (h *Handler) routeMessage(ctx context.Context, e tg.Entities, upd message.A
 	args := parts[1:]
 
 	// Ingest audio concurrently if command is not a media inspector
-	if isAudio && h.listener != nil && cmdName != "mediainfo" && cmdName != "mi" {
+	if isAudio && h.listener != nil && cmdName != "mediainfo" && cmdName != "mi" && cmdName != "spec" {
 		h.listener.HandleMessage(ctx, msg)
 	}
 
@@ -268,6 +268,8 @@ func (h *Handler) routeMessage(ctx context.Context, e tg.Entities, upd message.A
 		h.handleSearch(ctx, e, upd, msg, args)
 	case "mediainfo", "mi":
 		h.handleMediaInfo(ctx, e, upd, msg)
+	case "spec":
+		h.handleSpectrogram(ctx, e, upd, msg)
 	case "sources":
 		h.handleSources(ctx, e, upd, msg, senderID)
 	case "filter_mode", "filtermode":
