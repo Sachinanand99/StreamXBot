@@ -1,8 +1,8 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"html"
 	"math"
@@ -380,25 +380,6 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		return fmt.Sprintf("%.0f", v)
 	}
 
-	type ffprobeData struct {
-		Format struct {
-			Duration string            `json:"duration"`
-			BitRate  string            `json:"bit_rate"`
-			Size     string            `json:"size"`
-			Tags     map[string]string `json:"tags"`
-		} `json:"format"`
-		Streams []struct {
-			CodecName        string            `json:"codec_name"`
-			SampleRate       string            `json:"sample_rate"`
-			Channels         int               `json:"channels"`
-			BitsPerSample    int               `json:"bits_per_sample"`
-			BitsPerRawSample string            `json:"bits_per_raw_sample"`
-			Duration         string            `json:"duration"`
-			BitRate          string            `json:"bit_rate"`
-			Tags             map[string]string `json:"tags"`
-		} `json:"streams"`
-	}
-
 	audioPath := ""
 	defer func() {
 		if audioPath != "" {
@@ -436,30 +417,75 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		}
 	}
 
-	var probe ffprobeData
-	stats := map[string]float64{}
+	info := map[string]string{}
 	soxStats := map[string]float64{}
+	tags := map[string]string{}
 	if audioPath != "" {
-		if out, err := exec.CommandContext(analysisCtx, "ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", audioPath).Output(); err == nil {
-			_ = json.Unmarshal(out, &probe)
+		parseComment := func(line string) {
+			line = strings.Trim(strings.TrimSpace(line), "'\"")
+			if line == "" {
+				return
+			}
+			if idx := strings.Index(line, "="); idx > 0 {
+				if key, value := strings.TrimSpace(line[:idx]), strings.TrimSpace(line[idx+1:]); key != "" && value != "" {
+					tags[normalizeKey(key)] = value
+					return
+				}
+			}
+			if idx := strings.Index(line, ":"); idx > 0 {
+				if key, value := strings.TrimSpace(line[:idx]), strings.TrimSpace(line[idx+1:]); key != "" && value != "" {
+					tags[normalizeKey(key)] = value
+					return
+				}
+			}
+			tags["comment"] = line
 		}
-
-		out, _ := exec.CommandContext(analysisCtx, "ffmpeg", "-hide_banner", "-nostats", "-i", audioPath,
-			"-af", "astats=metadata=1:reset=0,ametadata=mode=print", "-f", "null", "-").CombinedOutput()
-		for _, line := range strings.Split(string(out), "\n") {
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) != 2 {
-				continue
-			}
-			key := strings.TrimSpace(parts[0])
-			if !strings.Contains(key, "lavfi.astats") {
-				continue
-			}
-			if value, ok := parseFloat(parts[1]); ok {
-				stats[key] = value
+		knownInfoKeys := map[string]bool{
+			"inputfile": true, "channels": true, "samplerate": true, "precision": true,
+			"duration": true, "filesize": true, "bitrate": true, "sampleencoding": true,
+			"endiantype": true, "reversenibbles": true, "reversebits": true,
+			"replaygain": true, "leveladjust": true, "comment": true, "comments": true,
+		}
+		if out, err := exec.CommandContext(analysisCtx, "sox", "--i", "-a", audioPath).CombinedOutput(); err == nil {
+			inComments := false
+			for _, raw := range strings.Split(string(out), "\n") {
+				line := strings.TrimSpace(raw)
+				if line == "" {
+					inComments = false
+					continue
+				}
+				if inComments {
+					if idx := strings.Index(line, ":"); idx >= 0 && !knownInfoKeys[normalizeKey(line[:idx])] {
+						parseComment(line)
+						continue
+					}
+					if strings.Contains(line, "=") {
+						parseComment(line)
+						continue
+					}
+					inComments = false
+				}
+				idx := strings.Index(line, ":")
+				if idx < 0 {
+					continue
+				}
+				key := normalizeKey(line[:idx])
+				value := strings.TrimSpace(line[idx+1:])
+				if key == "" {
+					continue
+				}
+				info[key] = value
+				switch key {
+				case "comments":
+					inComments = true
+					if value != "" {
+						parseComment(value)
+					}
+				case "comment":
+					parseComment(value)
+				}
 			}
 		}
-
 		if out, err := exec.CommandContext(analysisCtx, "sox", audioPath, "-n", "stat").CombinedOutput(); err == nil {
 			for _, line := range strings.Split(string(out), "\n") {
 				parts := strings.SplitN(line, ":", 2)
@@ -480,33 +506,6 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		}
 	}
 
-	stat := func(parts ...string) (float64, bool) {
-		for key, value := range stats {
-			normalized := normalizeKey(key)
-			matched := true
-			for _, part := range parts {
-				if !strings.Contains(normalized, normalizeKey(part)) {
-					matched = false
-					break
-				}
-			}
-			if matched {
-				return value, true
-			}
-		}
-		return 0, false
-	}
-
-	tags := map[string]string{}
-	if len(probe.Streams) > 0 {
-		for key, value := range probe.Streams[0].Tags {
-			tags[key] = strings.TrimSpace(value)
-		}
-	}
-	for key, value := range probe.Format.Tags {
-		tags[key] = strings.TrimSpace(value)
-	}
-
 	tagKey := normalizeKey
 	tagValue := func(names ...string) string {
 		for _, name := range names {
@@ -523,53 +522,17 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		return ""
 	}
 
-	bitRate := float64(0)
-	if v, ok := parseFloat(probe.Format.BitRate); ok {
-		bitRate = v
-	}
-	if bitRate == 0 && len(probe.Streams) > 0 {
-		if v, ok := parseFloat(probe.Streams[0].BitRate); ok {
-			bitRate = v
-		}
-	}
-
-	fileSize := float64(targetDoc.Size)
-	if v, ok := parseFloat(probe.Format.Size); ok && v > 0 {
-		fileSize = v
-	}
-
 	lengthSeconds := float64(duration)
-	if v, ok := parseFloat(probe.Format.Duration); ok && v > 0 {
-		lengthSeconds = v
-	} else if len(probe.Streams) > 0 {
-		if v, ok := parseFloat(probe.Streams[0].Duration); ok && v > 0 {
-			lengthSeconds = v
-		}
-	}
 	if v, ok := soxStats["lengthseconds"]; ok && v > 0 {
 		lengthSeconds = v
 	}
-
-	channels := 0
-	bits := 0
-	codec := ""
-	sampleRate := float64(0)
-	if len(probe.Streams) > 0 {
-		s := probe.Streams[0]
-		channels = s.Channels
-		codec = s.CodecName
-		if v, ok := parseFloat(s.SampleRate); ok {
-			sampleRate = v
-		}
-		bits = s.BitsPerSample
-		if v, ok := parseFloat(s.BitsPerRawSample); ok && v > 0 {
-			bits = int(v)
-		}
+	bitRateText := strings.TrimSpace(info["bitrate"])
+	if bitRateText == "" && lengthSeconds > 0 {
+		bitRateText = fmtRate(float64(targetDoc.Size) * 8 / lengthSeconds)
 	}
-	if bits == 0 {
-		if value, ok := stat("bitdepth"); ok && value > 0 {
-			bits = int(value)
-		}
+	fileSizeText := strings.TrimSpace(info["filesize"])
+	if fileSizeText == "" {
+		fileSizeText = fmtSize(float64(targetDoc.Size))
 	}
 
 	metaTitle := tagValue("title")
@@ -638,14 +601,10 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 	writeLine("albumartist", metaAlbumArtist)
 
 	sb.WriteString("\n")
-	writeLine("bitRate", fmtRate(bitRate))
-	channelsText := ""
-	if channels > 0 {
-		channelsText = strconv.Itoa(channels)
-	}
-	writeLine("channels", channelsText)
+	writeLine("bitRate", bitRateText)
+	writeLine("channels", strings.TrimSpace(info["channels"]))
 	writeLine("comments", comments)
-	writeLine("fileSize", fmtSize(fileSize))
+	writeLine("fileSize", fileSizeText)
 	writeLine("lengthSeconds", fmt.Sprintf("%.6f", lengthSeconds))
 
 	putSoxStat := func(label, key string, digits int) {
@@ -655,19 +614,12 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		}
 		writeLine(label, valueText)
 	}
-	putStat := func(label string, digits int, parts ...string) {
-		valueText := ""
-		if value, ok := stat(parts...); ok {
-			valueText = fmt.Sprintf("%.*f", digits, value)
-		}
-		writeLine(label, valueText)
-	}
 
 	putSoxStat("maximumAmplitude", "maximumamplitude", 6)
 	putSoxStat("maximumDelta", "maximumdelta", 6)
 	putSoxStat("meanAmplitude", "meanamplitude", 6)
 	putSoxStat("meanDelta", "meandelta", 6)
-	putStat("meanNorm", 6, "overall", "flatfactor")
+	putSoxStat("meanNorm", "meannorm", 6)
 	putSoxStat("midlineAmplitude", "midlineamplitude", 6)
 	putSoxStat("minimumAmplitude", "minimumamplitude", 6)
 	putSoxStat("minimumDelta", "minimumdelta", 6)
@@ -675,27 +627,9 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 	putSoxStat("rmsDelta", "rmsdelta", 6)
 	putSoxStat("roughFrequency", "roughfrequency", 0)
 
-	precisionText := ""
-	if bits > 0 {
-		precisionText = fmt.Sprintf("%d-bit", bits)
-	}
-	writeLine("precision", precisionText)
-
-	sampleEncodingText := ""
-	if codec != "" {
-		if bits > 0 {
-			sampleEncodingText = fmt.Sprintf("%d-bit %s", bits, codec)
-		} else {
-			sampleEncodingText = codec
-		}
-	}
-	writeLine("sampleEncoding", sampleEncodingText)
-
-	sampleRateText := ""
-	if sampleRate > 0 {
-		sampleRateText = fmt.Sprintf("%.0f", sampleRate)
-	}
-	writeLine("sampleRate", sampleRateText)
+	writeLine("precision", strings.TrimSpace(info["precision"]))
+	writeLine("sampleEncoding", strings.TrimSpace(info["sampleencoding"]))
+	writeLine("sampleRate", strings.TrimSpace(info["samplerate"]))
 	putSoxStat("samplesRead", "samplesread", 0)
 	putSoxStat("scaledBy", "scaledby", 1)
 	putSoxStat("volumeAdjustment", "volumeadjustment", 3)
@@ -989,49 +923,53 @@ func (h *Handler) handleSpectrogram(ctx context.Context, e tg.Entities, upd mess
 
 	if audioPath != "" && spectrogramPath == "" {
 		soxErrText := spectrogramErrText
-		nyquist := 24000
-		if out, err := exec.CommandContext(analysisCtx, "ffprobe", "-v", "error", "-select_streams", "a:0",
-			"-show_entries", "stream=sample_rate", "-of", "csv=p=0", audioPath).Output(); err == nil {
-			sampleRate := 0
-			if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &sampleRate); err == nil && sampleRate > 1 {
-				nyquist = sampleRate / 2
-			}
-		}
-
-		const fitHeight = 720
-		steps := []int{500, 1000, 2000, 4000, 5000, 10000, 20000, 50000, 100000}
-		height := 0
-		for _, stepHz := range steps {
-			candidate := (nyquist*40+stepHz/2)/stepHz + 1
-			if candidate <= fitHeight {
-				height = candidate
-				break
-			}
-		}
-		if height == 0 {
-			height = fitHeight
-		}
-
-		if spec, err := os.CreateTemp("", "streamgo_spec_ffmpeg_*.png"); err == nil {
+		if spec, err := os.CreateTemp("", "streamgo_spec_pipe_*.png"); err == nil {
 			spectrogramPath = spec.Name()
 			_ = spec.Close()
 			_ = os.Remove(spectrogramPath)
-			filter := fmt.Sprintf("showspectrumpic=s=1280x%d:legend=1:mode=combined:fscale=lin:scale=log:start=0:stop=%d", height, nyquist)
-			cmd := exec.CommandContext(analysisCtx, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-				"-i", audioPath, "-lavfi", filter, spectrogramPath)
-			if output, err := cmd.CombinedOutput(); err != nil {
+
+			decoder := exec.CommandContext(analysisCtx, "ffmpeg", "-v", "error", "-i", audioPath,
+				"-map", "0:a:0", "-vn", "-f", "sox", "-")
+			var decoderErr bytes.Buffer
+			decoder.Stderr = &decoderErr
+			decoderPipe, err := decoder.StdoutPipe()
+			if err != nil {
 				_ = os.Remove(spectrogramPath)
 				spectrogramPath = ""
-				fallbackErrText := formatSpecError(output, err)
-				switch {
-				case soxErrText != "" && fallbackErrText != "":
-					combinedErrText := "sox: " + soxErrText + " | ffmpeg: " + fallbackErrText
-					spectrogramErrText = formatSpecError([]byte(combinedErrText), nil)
-				case fallbackErrText != "":
-					spectrogramErrText = "ffmpeg: " + fallbackErrText
+				if decoderErrText := formatSpecError([]byte(err.Error()), nil); decoderErrText != "" {
+					spectrogramErrText = "sox: " + soxErrText + " | ffmpeg decode: " + decoderErrText
 				}
+			} else if err := decoder.Start(); err != nil {
+				_ = os.Remove(spectrogramPath)
+				spectrogramPath = ""
+				fallbackErrText := formatSpecError(nil, err)
+				combinedErrText := "sox: " + soxErrText + " | ffmpeg decode: " + fallbackErrText
+				spectrogramErrText = formatSpecError([]byte(combinedErrText), nil)
 			} else {
-				spectrogramErrText = ""
+				soxCmd := exec.CommandContext(analysisCtx, "sox", "-p", "-n", "spectrogram", "-o", spectrogramPath)
+				soxCmd.Stdin = decoderPipe
+				soxOutput, soxErr := soxCmd.CombinedOutput()
+				if soxErr != nil {
+					_ = decoderPipe.Close()
+				}
+				decoderErrRun := decoder.Wait()
+
+				if soxErr != nil || decoderErrRun != nil {
+					_ = os.Remove(spectrogramPath)
+					spectrogramPath = ""
+					fallbackErrText := formatSpecError(soxOutput, soxErr)
+					if decoderErrText := formatSpecError(decoderErr.Bytes(), decoderErrRun); decoderErrText != "" {
+						if fallbackErrText == "" {
+							fallbackErrText = "ffmpeg decode: " + decoderErrText
+						} else {
+							fallbackErrText += " | ffmpeg decode: " + decoderErrText
+						}
+					}
+					combinedErrText := "sox: " + soxErrText + " | fallback: " + fallbackErrText
+					spectrogramErrText = formatSpecError([]byte(combinedErrText), nil)
+				} else {
+					spectrogramErrText = ""
+				}
 			}
 		}
 	}
