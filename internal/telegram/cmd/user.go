@@ -122,20 +122,141 @@ func (h *Handler) handleSearch(ctx context.Context, e tg.Entities, upd message.A
 	_ = h.replyHTML(ctx, e, upd, sb.String(), nil)
 }
 
-// handleMediaInfo inspects technical metadata of an attached or replied audio file.
+// handleMediaInfo inspects technical metadata of an attached, replied, or recently sent audio/media file.
 func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd message.AnswerableMessageUpdate, msg *tg.Message) {
-	var targetDoc *tg.Document
+	docFromMessage := func(m *tg.Message) *tg.Document {
+		if m == nil || m.Media == nil {
+			return nil
+		}
+		if docMedia, ok := m.Media.(*tg.MessageMediaDocument); ok && docMedia.Document != nil {
+			doc, _ := docMedia.Document.(*tg.Document)
+			return doc
+		}
+		return nil
+	}
 
-	if msg.Media != nil {
-		if docMedia, ok := msg.Media.(*tg.MessageMediaDocument); ok && docMedia.Document != nil {
-			if doc, ok := docMedia.Document.(*tg.Document); ok {
-				targetDoc = doc
+	messagesFrom := func(res tg.MessagesMessagesClass) []tg.MessageClass {
+		switch list := res.(type) {
+		case *tg.MessagesMessages:
+			return list.Messages
+		case *tg.MessagesMessagesSlice:
+			return list.Messages
+		case *tg.MessagesChannelMessages:
+			return list.Messages
+		default:
+			return nil
+		}
+	}
+
+	senderIDFrom := func(m *tg.Message) int64 {
+		if m == nil || m.FromID == nil {
+			return 0
+		}
+		switch p := m.FromID.(type) {
+		case *tg.PeerUser:
+			return p.UserID
+		case *tg.PeerChat:
+			return -p.ChatID
+		case *tg.PeerChannel:
+			return -1000000000000 - p.ChannelID
+		default:
+			return 0
+		}
+	}
+
+	isAudioDoc := func(doc *tg.Document) bool {
+		if doc == nil {
+			return false
+		}
+		var fileName string
+		for _, attr := range doc.Attributes {
+			switch a := attr.(type) {
+			case *tg.DocumentAttributeAudio:
+				return true
+			case *tg.DocumentAttributeFilename:
+				fileName = strings.ToLower(strings.TrimSpace(a.FileName))
+			}
+		}
+		mime := strings.ToLower(strings.TrimSpace(doc.MimeType))
+		isAudioExt := strings.HasSuffix(fileName, ".flac") || strings.HasSuffix(fileName, ".mp3") ||
+			strings.HasSuffix(fileName, ".wav") || strings.HasSuffix(fileName, ".wave") ||
+			strings.HasSuffix(fileName, ".m4a") || strings.HasSuffix(fileName, ".alac") ||
+			strings.HasSuffix(fileName, ".aac") || strings.HasSuffix(fileName, ".ogg") ||
+			strings.HasSuffix(fileName, ".opus") || strings.HasSuffix(fileName, ".aif") ||
+			strings.HasSuffix(fileName, ".aiff") || strings.HasSuffix(fileName, ".wma")
+		return strings.HasPrefix(mime, "audio/") || isAudioExt ||
+			mime == "application/x-flac" || mime == "application/flac" || mime == "application/ogg"
+	}
+
+	var targetDoc *tg.Document
+	if msg != nil {
+		targetDoc = docFromMessage(msg)
+	}
+
+	if targetDoc == nil && msg != nil && msg.ReplyTo != nil {
+		if header, ok := msg.ReplyTo.(*tg.MessageReplyHeader); ok && header.ReplyToMsgID != 0 {
+			if h.tgService != nil {
+				if w := h.tgService.PrimaryWorker(); w != nil && w.API != nil {
+					res, err := w.API.MessagesGetMessages(ctx, []tg.InputMessageClass{&tg.InputMessageID{ID: header.ReplyToMsgID}})
+					if err == nil {
+						for _, m := range messagesFrom(res) {
+							if replied, ok := m.(*tg.Message); ok {
+								if doc := docFromMessage(replied); doc != nil {
+									targetDoc = doc
+									break
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if targetDoc == nil && msg != nil && h.tgService != nil {
+		if w := h.tgService.PrimaryWorker(); w != nil && w.API != nil {
+			if peer := extractInputPeer(msg.PeerID, e, w); peer != nil {
+				res, err := w.API.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+					Peer:     peer,
+					OffsetID: msg.ID,
+					Limit:    30,
+				})
+				if err == nil {
+					commandSender := senderIDFrom(msg)
+					var fallbackDoc *tg.Document
+					for _, m := range messagesFrom(res) {
+						older, ok := m.(*tg.Message)
+						if !ok {
+							continue
+						}
+						if msg.ID != 0 && older.ID >= msg.ID {
+							continue
+						}
+						if candidateSender := senderIDFrom(older); commandSender != 0 && candidateSender != 0 && candidateSender != commandSender {
+							continue
+						}
+						doc := docFromMessage(older)
+						if doc == nil {
+							continue
+						}
+						if fallbackDoc == nil {
+							fallbackDoc = doc
+						}
+						if isAudioDoc(doc) {
+							targetDoc = doc
+							break
+						}
+					}
+					if targetDoc == nil {
+						targetDoc = fallbackDoc
+					}
+				}
 			}
 		}
 	}
 
 	if targetDoc == nil {
-		_ = h.replyHTML(ctx, e, upd, "Usage:\n/mediainfo &lt;link&gt;\nor reply to an audio / media / link", nil)
+		_ = h.replyHTML(ctx, e, upd, "No recent media found. Send an audio/media file and then /mi, or reply to it with /mi.", nil)
 		return
 	}
 
