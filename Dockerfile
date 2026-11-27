@@ -35,7 +35,8 @@ RUN apk add --no-cache \
     ca-certificates \
     tzdata \
     ffmpeg \
-    mediainfo
+    mediainfo \
+    sox
 
 WORKDIR /app
 

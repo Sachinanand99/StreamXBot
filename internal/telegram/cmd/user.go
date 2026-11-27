@@ -843,41 +843,14 @@ func (h *Handler) handleSpectrogram(ctx context.Context, e tg.Entities, upd mess
 
 	if audioPath == "" {
 		_ = h.replyHTML(ctx, e, upd, "Unable to download the audio for the spectrogram.", nil)
-	} else {
-		nyquist := 24000
-		if out, err := exec.CommandContext(analysisCtx, "ffprobe", "-v", "error", "-select_streams", "a:0",
-			"-show_entries", "stream=sample_rate", "-of", "csv=p=0", audioPath).Output(); err == nil {
-			sampleRate := 0
-			if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &sampleRate); err == nil && sampleRate > 1 {
-				nyquist = sampleRate / 2
-			}
-		}
-
-		const fitHeight = 720
-		steps := []int{500, 1000, 2000, 4000, 5000, 10000, 20000, 50000, 100000}
-		height := 0
-		for _, stepHz := range steps {
-			candidate := (nyquist*40+stepHz/2)/stepHz + 1
-			if candidate <= fitHeight {
-				height = candidate
-				break
-			}
-		}
-		if height == 0 {
-			height = fitHeight
-		}
-		filter := fmt.Sprintf("showspectrumpic=s=1280x%d:legend=1:mode=combined:fscale=lin:scale=log:start=0:stop=%d", height, nyquist)
-
-		if spec, err := os.CreateTemp("", "streamgo_spec_*.png"); err == nil {
-			spectrogramPath = spec.Name()
-			_ = spec.Close()
+	} else if spec, err := os.CreateTemp("", "streamgo_spec_*.png"); err == nil {
+		spectrogramPath = spec.Name()
+		_ = spec.Close()
+		_ = os.Remove(spectrogramPath)
+		cmd := exec.CommandContext(analysisCtx, "sox", audioPath, "-n", "spectrogram", "-o", spectrogramPath)
+		if _, err := cmd.CombinedOutput(); err != nil {
 			_ = os.Remove(spectrogramPath)
-			cmd := exec.CommandContext(analysisCtx, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-				"-i", audioPath, "-lavfi", filter, spectrogramPath)
-			if _, err := cmd.CombinedOutput(); err != nil {
-				_ = os.Remove(spectrogramPath)
-				spectrogramPath = ""
-			}
+			spectrogramPath = ""
 		}
 	}
 
