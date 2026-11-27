@@ -687,60 +687,308 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 	}
 }
 
-const maxSpectrogramFileSize = 500 * 1024 * 1024 // 500 MB limit
-
 // handleSpectrogram generates and sends a spectrogram for an attached, replied, or recently sent audio file.
 func (h *Handler) handleSpectrogram(ctx context.Context, e tg.Entities, upd message.AnswerableMessageUpdate, msg *tg.Message) {
-	if msg == nil || h.tgService == nil {
-		return
-	}
-	w := h.tgService.PrimaryWorker()
-	if w == nil || w.API == nil {
-		return
+	docFromMessage := func(m *tg.Message) *tg.Document {
+		if m == nil || m.Media == nil {
+			return nil
+		}
+		if docMedia, ok := m.Media.(*tg.MessageMediaDocument); ok && docMedia.Document != nil {
+			doc, _ := docMedia.Document.(*tg.Document)
+			return doc
+		}
+		return nil
 	}
 
-	targetDoc := h.resolveTargetAudioDoc(ctx, e, w, msg)
+	messagesFrom := func(res tg.MessagesMessagesClass) []tg.MessageClass {
+		switch list := res.(type) {
+		case *tg.MessagesMessages:
+			return list.Messages
+		case *tg.MessagesMessagesSlice:
+			return list.Messages
+		case *tg.MessagesChannelMessages:
+			return list.Messages
+		default:
+			return nil
+		}
+	}
+
+	senderIDFrom := func(m *tg.Message) int64 {
+		if m == nil || m.FromID == nil {
+			return 0
+		}
+		switch p := m.FromID.(type) {
+		case *tg.PeerUser:
+			return p.UserID
+		case *tg.PeerChat:
+			return -p.ChatID
+		case *tg.PeerChannel:
+			return -1000000000000 - p.ChannelID
+		default:
+			return 0
+		}
+	}
+
+	isAudioDoc := func(doc *tg.Document) bool {
+		if doc == nil {
+			return false
+		}
+		var fileName string
+		for _, attr := range doc.Attributes {
+			switch a := attr.(type) {
+			case *tg.DocumentAttributeAudio:
+				return true
+			case *tg.DocumentAttributeFilename:
+				fileName = strings.ToLower(strings.TrimSpace(a.FileName))
+			}
+		}
+		mime := strings.ToLower(strings.TrimSpace(doc.MimeType))
+		isAudioExt := strings.HasSuffix(fileName, ".flac") || strings.HasSuffix(fileName, ".mp3") ||
+			strings.HasSuffix(fileName, ".wav") || strings.HasSuffix(fileName, ".wave") ||
+			strings.HasSuffix(fileName, ".m4a") || strings.HasSuffix(fileName, ".alac") ||
+			strings.HasSuffix(fileName, ".aac") || strings.HasSuffix(fileName, ".ogg") ||
+			strings.HasSuffix(fileName, ".opus") || strings.HasSuffix(fileName, ".aif") ||
+			strings.HasSuffix(fileName, ".aiff") || strings.HasSuffix(fileName, ".wma")
+		return strings.HasPrefix(mime, "audio/") || isAudioExt ||
+			mime == "application/x-flac" || mime == "application/flac" || mime == "application/ogg"
+	}
+
+	var targetDoc *tg.Document
+	if msg != nil {
+		targetDoc = docFromMessage(msg)
+	}
+
+	if targetDoc == nil && msg != nil && msg.ReplyTo != nil {
+		if header, ok := msg.ReplyTo.(*tg.MessageReplyHeader); ok && header.ReplyToMsgID != 0 {
+			if h.tgService != nil {
+				if w := h.tgService.PrimaryWorker(); w != nil && w.API != nil {
+					res, err := w.API.MessagesGetMessages(ctx, []tg.InputMessageClass{&tg.InputMessageID{ID: header.ReplyToMsgID}})
+					if err == nil {
+						for _, m := range messagesFrom(res) {
+							if replied, ok := m.(*tg.Message); ok {
+								if doc := docFromMessage(replied); doc != nil {
+									targetDoc = doc
+									break
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if targetDoc == nil && msg != nil && h.tgService != nil {
+		if w := h.tgService.PrimaryWorker(); w != nil && w.API != nil {
+			if peer := extractInputPeer(msg.PeerID, e, w); peer != nil {
+				res, err := w.API.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+					Peer:     peer,
+					OffsetID: msg.ID,
+					Limit:    30,
+				})
+				if err == nil {
+					commandSender := senderIDFrom(msg)
+					var fallbackDoc *tg.Document
+					for _, m := range messagesFrom(res) {
+						older, ok := m.(*tg.Message)
+						if !ok {
+							continue
+						}
+						if msg.ID != 0 && older.ID >= msg.ID {
+							continue
+						}
+						if candidateSender := senderIDFrom(older); commandSender != 0 && candidateSender != 0 && candidateSender != commandSender {
+							continue
+						}
+						doc := docFromMessage(older)
+						if doc == nil {
+							continue
+						}
+						if fallbackDoc == nil {
+							fallbackDoc = doc
+						}
+						if isAudioDoc(doc) {
+							targetDoc = doc
+							break
+						}
+					}
+					if targetDoc == nil {
+						targetDoc = fallbackDoc
+					}
+				}
+			}
+		}
+	}
+
 	if targetDoc == nil {
 		_ = h.replyHTML(ctx, e, upd, "No recent media found. Send an audio/media file and then /spec, or reply to it with /spec.", nil)
 		return
 	}
 
-	if targetDoc.Size > maxSpectrogramFileSize {
-		_ = h.replyHTML(ctx, e, upd, "File is too large to generate a spectrogram (max 100 MB).", nil)
-		return
+	sentMessageID := func(update tg.UpdatesClass) int {
+		fromMessage := func(m tg.MessageClass) int {
+			if full, ok := m.(*tg.Message); ok {
+				return full.ID
+			}
+			return 0
+		}
+		fromUpdates := func(items []tg.UpdateClass) int {
+			for _, item := range items {
+				switch u := item.(type) {
+				case *tg.UpdateNewMessage:
+					if id := fromMessage(u.Message); id != 0 {
+						return id
+					}
+				case *tg.UpdateNewChannelMessage:
+					if id := fromMessage(u.Message); id != 0 {
+						return id
+					}
+				}
+			}
+			return 0
+		}
+
+		switch u := update.(type) {
+		case *tg.UpdateShortMessage:
+			return u.ID
+		case *tg.UpdateShortSentMessage:
+			return u.ID
+		case *tg.UpdateShort:
+			if nested, ok := u.Update.(*tg.UpdateNewMessage); ok {
+				return fromMessage(nested.Message)
+			}
+			if nested, ok := u.Update.(*tg.UpdateNewChannelMessage); ok {
+				return fromMessage(nested.Message)
+			}
+		case *tg.Updates:
+			return fromUpdates(u.Updates)
+		case *tg.UpdatesCombined:
+			return fromUpdates(u.Updates)
+		}
+		return 0
 	}
 
 	waitMessageID := 0
-	if updates, err := message.NewSender(w.API).Reply(e, upd).Text(ctx, "⏳ Please wait, generating spectrogram..."); err == nil {
-		waitMessageID = extractSentMessageID(updates)
+	if h.tgService != nil {
+		if w := h.tgService.PrimaryWorker(); w != nil && w.API != nil {
+			if updates, err := message.NewSender(w.API).Reply(e, upd).Text(ctx, "⏳ Please wait, generating spectrogram..."); err == nil {
+				waitMessageID = sentMessageID(updates)
+			}
+		}
 	}
+
+	var fileName string
+	for _, attr := range targetDoc.Attributes {
+		if a, ok := attr.(*tg.DocumentAttributeFilename); ok {
+			fileName = a.FileName
+			break
+		}
+	}
+	if strings.TrimSpace(fileName) == "" {
+		fileName = "audio"
+	}
+
+	analysisCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+
+	audioPath := ""
+	spectrogramPath := ""
+	spectrogramErrText := ""
 	defer func() {
-		if waitMessageID != 0 {
-			h.deleteMessageSafe(e, w, msg.PeerID, waitMessageID)
+		if audioPath != "" {
+			_ = os.Remove(audioPath)
+		}
+		if spectrogramPath != "" {
+			_ = os.Remove(spectrogramPath)
 		}
 	}()
 
-	analysisCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
+	if h.tgService != nil {
+		ext := strings.ToLower(filepath.Ext(fileName))
+		if ext == "" {
+			mime := strings.ToLower(targetDoc.MimeType)
+			switch {
+			case strings.Contains(mime, "flac"):
+				ext = ".flac"
+			case strings.Contains(mime, "mpeg") || strings.Contains(mime, "mp3"):
+				ext = ".mp3"
+			case strings.Contains(mime, "mp4") || strings.Contains(mime, "m4a"):
+				ext = ".m4a"
+			default:
+				ext = ".bin"
+			}
+		}
+		location := &tg.InputDocumentFileLocation{
+			ID:            targetDoc.ID,
+			AccessHash:    targetDoc.AccessHash,
+			FileReference: targetDoc.FileReference,
+		}
+		if tmp, err := os.CreateTemp("", "streamgo_spec_src_*"+ext); err == nil {
+			audioPath = tmp.Name()
+			dlErr := h.tgService.DownloadPartial(analysisCtx, location, 0, tmp)
+			_ = tmp.Close()
+			if dlErr != nil {
+				_ = os.Remove(audioPath)
+				audioPath = ""
+			}
+		}
+	}
 
-	audioPath, err := h.downloadDocumentToTemp(analysisCtx, targetDoc)
-	if err != nil {
+	if audioPath == "" {
 		_ = h.replyHTML(ctx, e, upd, "Unable to download the audio for the spectrogram.", nil)
-		return
+	} else if spec, err := os.CreateTemp("", "streamgo_spec_*.png"); err == nil {
+		spectrogramPath = spec.Name()
+		_ = spec.Close()
+		_ = os.Remove(spectrogramPath)
+		cmd := exec.CommandContext(analysisCtx, "sox", audioPath, "-n", "spectrogram", "-o", spectrogramPath)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			_ = os.Remove(spectrogramPath)
+			spectrogramPath = ""
+			spectrogramErrText = strings.TrimSpace(string(output))
+			if spectrogramErrText == "" {
+				spectrogramErrText = err.Error()
+			}
+			spectrogramErrText = strings.Join(strings.Fields(spectrogramErrText), " ")
+			if runes := []rune(spectrogramErrText); len(runes) > 500 {
+				spectrogramErrText = string(runes[:500]) + "..."
+			}
+		}
 	}
-	defer os.Remove(audioPath)
 
-	spectrogramPath, err := generateSpectrogramImage(analysisCtx, audioPath)
-	if err != nil {
-		_ = h.replyHTML(ctx, e, upd, "Unable to generate spectrogram. Make sure the file contains valid audio.", nil)
-		return
+	if spectrogramPath != "" {
+		if h.tgService != nil {
+			if w := h.tgService.PrimaryWorker(); w != nil && w.API != nil {
+				if uploaded, err := uploader.NewUploader(w.API).FromPath(analysisCtx, spectrogramPath); err == nil {
+					specFileName := "spectrogram.png"
+					if base := strings.TrimSpace(filepath.Base(fileName)); base != "" && base != "." {
+						specFileName = strings.TrimSuffix(base, filepath.Ext(base)) + "_spectrogram.png"
+					}
+					_, _ = message.NewSender(w.API).Reply(e, upd).Media(analysisCtx,
+						message.UploadedDocument(uploaded).
+							MIME("image/png").
+							Filename(specFileName).
+							ForceFile(true))
+				} else {
+					_ = h.replyHTML(ctx, e, upd, "Unable to upload the spectrogram.", nil)
+				}
+			}
+		}
+	} else if audioPath != "" {
+		reply := "Unable to generate spectrogram."
+		if spectrogramErrText != "" {
+			reply += "\n<code>" + html.EscapeString(spectrogramErrText) + "</code>"
+		}
+		_ = h.replyHTML(ctx, e, upd, reply, nil)
 	}
-	defer os.Remove(spectrogramPath)
 
-	uploaded, err := uploader.NewUploader(w.API).FromPath(analysisCtx, spectrogramPath)
-	if err != nil {
-		_ = h.replyHTML(ctx, e, upd, "Unable to upload the spectrogram.", nil)
-		return
+	if waitMessageID != 0 && h.tgService != nil {
+		if w := h.tgService.PrimaryWorker(); w != nil && w.API != nil {
+			deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer deleteCancel()
+			_, _ = w.API.MessagesDeleteMessages(deleteCtx, &tg.MessagesDeleteMessagesRequest{
+				ID:     []int{waitMessageID},
+				Revoke: true,
+			})
+		}
 	}
-	_, _ = message.NewSender(w.API).Reply(e, upd).UploadedPhoto(analysisCtx, uploaded)
 }
