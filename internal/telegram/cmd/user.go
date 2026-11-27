@@ -460,6 +460,40 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		return 0, false
 	}
 
+	tags := map[string]string{}
+	if len(probe.Streams) > 0 {
+		for key, value := range probe.Streams[0].Tags {
+			tags[key] = strings.TrimSpace(value)
+		}
+	}
+	for key, value := range probe.Format.Tags {
+		tags[key] = strings.TrimSpace(value)
+	}
+
+	tagKey := func(raw string) string {
+		var key strings.Builder
+		for _, r := range strings.ToLower(strings.TrimSpace(raw)) {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+				key.WriteRune(r)
+			}
+		}
+		return key.String()
+	}
+	tagValue := func(names ...string) string {
+		for _, name := range names {
+			wanted := tagKey(name)
+			if wanted == "" {
+				continue
+			}
+			for key, value := range tags {
+				if tagKey(key) == wanted && value != "" {
+					return value
+				}
+			}
+		}
+		return ""
+	}
+
 	bitRate := float64(0)
 	if v, ok := parseFloat(probe.Format.BitRate); ok {
 		bitRate = v
@@ -488,7 +522,6 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 	bits := 0
 	codec := ""
 	sampleRate := float64(0)
-	comments := ""
 	if len(probe.Streams) > 0 {
 		s := probe.Streams[0]
 		channels = s.Channels
@@ -500,86 +533,145 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		if v, ok := parseFloat(s.BitsPerRawSample); ok && v > 0 {
 			bits = int(v)
 		}
-		if s.Tags != nil {
-			comments = strings.TrimSpace(s.Tags["comment"])
+	}
+
+	metaTitle := tagValue("title")
+	metaAlbum := tagValue("album")
+	metaDate := tagValue("date", "year")
+	metaCopyright := tagValue("copyright")
+	metaBarcode := tagValue("barcode")
+	metaArtist := tagValue("artist")
+	metaAlbumArtist := tagValue("albumartist", "album artist", "album_artist")
+
+	if metaTitle == "" {
+		metaTitle = title
+	}
+	if metaArtist == "" {
+		metaArtist = artist
+	}
+
+	comments := tagValue("comment", "comments")
+	commentHttps := tagValue("commenthttps", "commenthttpsurl", "comment url", "applemusicurl")
+	if commentHttps == "" {
+		for key, value := range tags {
+			normalizedKey := tagKey(key)
+			lowerValue := strings.ToLower(value)
+			if strings.Contains(normalizedKey, "comment") &&
+				(strings.Contains(normalizedKey, "https") || strings.HasPrefix(lowerValue, "http") || strings.HasPrefix(lowerValue, "//")) {
+				commentHttps = value
+				break
+			}
 		}
 	}
-	if probe.Format.Tags != nil {
-		if v := strings.TrimSpace(probe.Format.Tags["comment"]); v != "" {
-			comments = v
+	if lowerComments := strings.ToLower(comments); strings.HasPrefix(lowerComments, "http") || strings.HasPrefix(lowerComments, "//") {
+		if commentHttps == "" {
+			commentHttps = comments
+		}
+		comments = ""
+	}
+
+	bpm := ""
+	if rawBPM := tagValue("bpm", "tbpm"); rawBPM != "" {
+		if fields := strings.Fields(rawBPM); len(fields) > 0 {
+			if value, ok := parseFloat(fields[0]); ok && value > 0 {
+				bpm = fmt.Sprintf("%.0f", value)
+			}
 		}
 	}
 
-	sizeMB := float64(targetDoc.Size) / (1024 * 1024)
 	var sb strings.Builder
-	sb.WriteString("<b>Media Information:</b>\n\n")
-	if title != "" {
-		sb.WriteString(fmt.Sprintf("• <b>Title:</b> %s\n", html.EscapeString(title)))
-	}
-	if artist != "" {
-		sb.WriteString(fmt.Sprintf("• <b>Artist:</b> %s\n", html.EscapeString(artist)))
-	}
-	if fileName != "" {
-		sb.WriteString(fmt.Sprintf("• <b>File:</b> <code>%s</code>\n", html.EscapeString(fileName)))
-	}
-	sb.WriteString(fmt.Sprintf("• <b>MIME:</b> <code>%s</code>\n", html.EscapeString(targetDoc.MimeType)))
-	sb.WriteString(fmt.Sprintf("• <b>Size:</b> %.2f MB\n", sizeMB))
-	if duration > 0 {
-		sb.WriteString(fmt.Sprintf("• <b>Duration:</b> %s\n", formatSeconds(int32(duration))))
+	writeLine := func(label, value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			sb.WriteString(label + ":\n")
+			return
+		}
+		sb.WriteString(label + ": <b>" + html.EscapeString(value) + "</b>\n")
 	}
 
-	if audioPath != "" {
-		sb.WriteString("\n")
-		if rate := fmtRate(bitRate); rate != "" {
-			sb.WriteString(fmt.Sprintf("bitRate: %s\n", rate))
-		}
-		if channels > 0 {
-			sb.WriteString(fmt.Sprintf("channels: %d\n", channels))
-		}
-		sb.WriteString(fmt.Sprintf("comments: %s\n", html.EscapeString(comments)))
-		sb.WriteString(fmt.Sprintf("fileSize: %s\n", fmtSize(fileSize)))
-		sb.WriteString(fmt.Sprintf("lengthSeconds: %.6f\n", lengthSeconds))
+	writeLine("Filename", fileName)
+	durationText := ""
+	if lengthSeconds > 0 {
+		roundedSeconds := int(math.Round(lengthSeconds))
+		durationText = fmt.Sprintf("%02d:%02d seconds", roundedSeconds/60, roundedSeconds%60)
+	}
+	writeLine("Duration", durationText)
+	writeLine("BPM", bpm)
 
-		putStat := func(label, scope, suffix string, digits int) {
-			if value, ok := stat(scope, suffix); ok {
-				sb.WriteString(fmt.Sprintf("%s: %.*f\n", label, digits, value))
-			}
-		}
-		putStat("maximumAmplitude", "Overall", "Max_level", 6)
-		putStat("maximumDelta", "Difference", "Max_level", 6)
-		putStat("meanAmplitude", "Overall", "Mean_level", 6)
-		putStat("meanDelta", "Difference", "Mean_level", 6)
-		putStat("meanNorm", "Overall", "Flat_factor", 6)
-		putStat("midlineAmplitude", "Overall", "DC_offset", 6)
-		putStat("minimumAmplitude", "Overall", "Min_level", 6)
-		putStat("minimumDelta", "Difference", "Min_level", 6)
-		putStat("rmsAmplitude", "Overall", "RMS_level", 6)
-		putStat("rmsDelta", "Difference", "RMS_level", 6)
-		putStat("roughFrequency", "Overall", "Zero_crossings_rate", 0)
+	sb.WriteString("\n")
+	writeLine("title", metaTitle)
+	writeLine("album", metaAlbum)
+	writeLine("date", metaDate)
+	writeLine("copyright", metaCopyright)
+	writeLine("barcode", metaBarcode)
+	writeLine("artist", metaArtist)
+	writeLine("albumartist", metaAlbumArtist)
 
+	sb.WriteString("\n")
+	writeLine("bitRate", fmtRate(bitRate))
+	channelsText := ""
+	if channels > 0 {
+		channelsText = strconv.Itoa(channels)
+	}
+	writeLine("channels", channelsText)
+	writeLine("commentHttps", commentHttps)
+	writeLine("comments", comments)
+	writeLine("fileSize", fmtSize(fileSize))
+	writeLine("lengthSeconds", fmt.Sprintf("%.6f", lengthSeconds))
+
+	putStat := func(label, scope, suffix string, digits int) {
+		valueText := ""
+		if value, ok := stat(scope, suffix); ok {
+			valueText = fmt.Sprintf("%.*f", digits, value)
+		}
+		writeLine(label, valueText)
+	}
+	putStat("maximumAmplitude", "Overall", "Max_level", 6)
+	putStat("maximumDelta", "Difference", "Max_level", 6)
+	putStat("meanAmplitude", "Overall", "Mean_level", 6)
+	putStat("meanDelta", "Difference", "Mean_level", 6)
+	putStat("meanNorm", "Overall", "Flat_factor", 6)
+	putStat("midlineAmplitude", "Overall", "DC_offset", 6)
+	putStat("minimumAmplitude", "Overall", "Min_level", 6)
+	putStat("minimumDelta", "Difference", "Min_level", 6)
+	putStat("rmsAmplitude", "Overall", "RMS_level", 6)
+	putStat("rmsDelta", "Difference", "RMS_level", 6)
+	putStat("roughFrequency", "Overall", "Zero_crossings_rate", 0)
+
+	precisionText := ""
+	if bits > 0 {
+		precisionText = fmt.Sprintf("%d-bit", bits)
+	}
+	writeLine("precision", precisionText)
+
+	sampleEncodingText := ""
+	if codec != "" {
 		if bits > 0 {
-			sb.WriteString(fmt.Sprintf("precision: %d-bit\n", bits))
+			sampleEncodingText = fmt.Sprintf("%d-bit %s", bits, codec)
+		} else {
+			sampleEncodingText = codec
 		}
-		if codec != "" {
-			if bits > 0 {
-				sb.WriteString(fmt.Sprintf("sampleEncoding: %d-bit %s\n", bits, html.EscapeString(codec)))
-			} else {
-				sb.WriteString(fmt.Sprintf("sampleEncoding: %s\n", html.EscapeString(codec)))
-			}
-		}
-		if sampleRate > 0 {
-			sb.WriteString(fmt.Sprintf("sampleRate: %.0f\n", sampleRate))
-		}
-		putStat("samplesRead", "Overall", "Number_of_samples", 0)
-		if v, ok := stat("Overall", "Scaled_by"); ok {
-			sb.WriteString(fmt.Sprintf("scaledBy: %.1f\n", v))
-		}
-		if v, ok := stat("Overall", "Volume_adjustment"); ok {
-			sb.WriteString(fmt.Sprintf("volumeAdjustment: %.3f\n", v))
-		}
-	} else {
-		sb.WriteString("\nDetailed statistics unavailable.\n")
 	}
+	writeLine("sampleEncoding", sampleEncodingText)
+
+	sampleRateText := ""
+	if sampleRate > 0 {
+		sampleRateText = fmt.Sprintf("%.0f", sampleRate)
+	}
+	writeLine("sampleRate", sampleRateText)
+	putStat("samplesRead", "Overall", "Number_of_samples", 0)
+
+	scaledByText := ""
+	if value, ok := stat("Overall", "Scaled_by"); ok {
+		scaledByText = fmt.Sprintf("%.1f", value)
+	}
+	writeLine("scaledBy", scaledByText)
+
+	volumeAdjustmentText := ""
+	if value, ok := stat("Overall", "Volume_adjustment"); ok {
+		volumeAdjustmentText = fmt.Sprintf("%.3f", value)
+	}
+	writeLine("volumeAdjustment", volumeAdjustmentText)
 
 	_ = h.replyHTML(ctx, e, upd, sb.String(), nil)
 
@@ -595,287 +687,60 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 	}
 }
 
+const maxSpectrogramFileSize = 500 * 1024 * 1024 // 500 MB limit
+
 // handleSpectrogram generates and sends a spectrogram for an attached, replied, or recently sent audio file.
 func (h *Handler) handleSpectrogram(ctx context.Context, e tg.Entities, upd message.AnswerableMessageUpdate, msg *tg.Message) {
-	docFromMessage := func(m *tg.Message) *tg.Document {
-		if m == nil || m.Media == nil {
-			return nil
-		}
-		if docMedia, ok := m.Media.(*tg.MessageMediaDocument); ok && docMedia.Document != nil {
-			doc, _ := docMedia.Document.(*tg.Document)
-			return doc
-		}
-		return nil
+	if msg == nil || h.tgService == nil {
+		return
+	}
+	w := h.tgService.PrimaryWorker()
+	if w == nil || w.API == nil {
+		return
 	}
 
-	messagesFrom := func(res tg.MessagesMessagesClass) []tg.MessageClass {
-		switch list := res.(type) {
-		case *tg.MessagesMessages:
-			return list.Messages
-		case *tg.MessagesMessagesSlice:
-			return list.Messages
-		case *tg.MessagesChannelMessages:
-			return list.Messages
-		default:
-			return nil
-		}
-	}
-
-	senderIDFrom := func(m *tg.Message) int64 {
-		if m == nil || m.FromID == nil {
-			return 0
-		}
-		switch p := m.FromID.(type) {
-		case *tg.PeerUser:
-			return p.UserID
-		case *tg.PeerChat:
-			return -p.ChatID
-		case *tg.PeerChannel:
-			return -1000000000000 - p.ChannelID
-		default:
-			return 0
-		}
-	}
-
-	isAudioDoc := func(doc *tg.Document) bool {
-		if doc == nil {
-			return false
-		}
-		var fileName string
-		for _, attr := range doc.Attributes {
-			switch a := attr.(type) {
-			case *tg.DocumentAttributeAudio:
-				return true
-			case *tg.DocumentAttributeFilename:
-				fileName = strings.ToLower(strings.TrimSpace(a.FileName))
-			}
-		}
-		mime := strings.ToLower(strings.TrimSpace(doc.MimeType))
-		isAudioExt := strings.HasSuffix(fileName, ".flac") || strings.HasSuffix(fileName, ".mp3") ||
-			strings.HasSuffix(fileName, ".wav") || strings.HasSuffix(fileName, ".wave") ||
-			strings.HasSuffix(fileName, ".m4a") || strings.HasSuffix(fileName, ".alac") ||
-			strings.HasSuffix(fileName, ".aac") || strings.HasSuffix(fileName, ".ogg") ||
-			strings.HasSuffix(fileName, ".opus") || strings.HasSuffix(fileName, ".aif") ||
-			strings.HasSuffix(fileName, ".aiff") || strings.HasSuffix(fileName, ".wma")
-		return strings.HasPrefix(mime, "audio/") || isAudioExt ||
-			mime == "application/x-flac" || mime == "application/flac" || mime == "application/ogg"
-	}
-
-	var targetDoc *tg.Document
-	if msg != nil {
-		targetDoc = docFromMessage(msg)
-	}
-
-	if targetDoc == nil && msg != nil && msg.ReplyTo != nil {
-		if header, ok := msg.ReplyTo.(*tg.MessageReplyHeader); ok && header.ReplyToMsgID != 0 {
-			if h.tgService != nil {
-				if w := h.tgService.PrimaryWorker(); w != nil && w.API != nil {
-					res, err := w.API.MessagesGetMessages(ctx, []tg.InputMessageClass{&tg.InputMessageID{ID: header.ReplyToMsgID}})
-					if err == nil {
-						for _, m := range messagesFrom(res) {
-							if replied, ok := m.(*tg.Message); ok {
-								if doc := docFromMessage(replied); doc != nil {
-									targetDoc = doc
-									break
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	if targetDoc == nil && msg != nil && h.tgService != nil {
-		if w := h.tgService.PrimaryWorker(); w != nil && w.API != nil {
-			if peer := extractInputPeer(msg.PeerID, e, w); peer != nil {
-				res, err := w.API.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
-					Peer:     peer,
-					OffsetID: msg.ID,
-					Limit:    30,
-				})
-				if err == nil {
-					commandSender := senderIDFrom(msg)
-					var fallbackDoc *tg.Document
-					for _, m := range messagesFrom(res) {
-						older, ok := m.(*tg.Message)
-						if !ok {
-							continue
-						}
-						if msg.ID != 0 && older.ID >= msg.ID {
-							continue
-						}
-						if candidateSender := senderIDFrom(older); commandSender != 0 && candidateSender != 0 && candidateSender != commandSender {
-							continue
-						}
-						doc := docFromMessage(older)
-						if doc == nil {
-							continue
-						}
-						if fallbackDoc == nil {
-							fallbackDoc = doc
-						}
-						if isAudioDoc(doc) {
-							targetDoc = doc
-							break
-						}
-					}
-					if targetDoc == nil {
-						targetDoc = fallbackDoc
-					}
-				}
-			}
-		}
-	}
-
+	targetDoc := h.resolveTargetAudioDoc(ctx, e, w, msg)
 	if targetDoc == nil {
 		_ = h.replyHTML(ctx, e, upd, "No recent media found. Send an audio/media file and then /spec, or reply to it with /spec.", nil)
 		return
 	}
 
-	sentMessageID := func(update tg.UpdatesClass) int {
-		fromMessage := func(m tg.MessageClass) int {
-			if full, ok := m.(*tg.Message); ok {
-				return full.ID
-			}
-			return 0
-		}
-		fromUpdates := func(items []tg.UpdateClass) int {
-			for _, item := range items {
-				switch u := item.(type) {
-				case *tg.UpdateNewMessage:
-					if id := fromMessage(u.Message); id != 0 {
-						return id
-					}
-				case *tg.UpdateNewChannelMessage:
-					if id := fromMessage(u.Message); id != 0 {
-						return id
-					}
-				}
-			}
-			return 0
-		}
-
-		switch u := update.(type) {
-		case *tg.UpdateShortMessage:
-			return u.ID
-		case *tg.UpdateShortSentMessage:
-			return u.ID
-		case *tg.UpdateShort:
-			if nested, ok := u.Update.(*tg.UpdateNewMessage); ok {
-				return fromMessage(nested.Message)
-			}
-			if nested, ok := u.Update.(*tg.UpdateNewChannelMessage); ok {
-				return fromMessage(nested.Message)
-			}
-		case *tg.Updates:
-			return fromUpdates(u.Updates)
-		case *tg.UpdatesCombined:
-			return fromUpdates(u.Updates)
-		}
-		return 0
+	if targetDoc.Size > maxSpectrogramFileSize {
+		_ = h.replyHTML(ctx, e, upd, "File is too large to generate a spectrogram (max 100 MB).", nil)
+		return
 	}
 
 	waitMessageID := 0
-	if h.tgService != nil {
-		if w := h.tgService.PrimaryWorker(); w != nil && w.API != nil {
-			if updates, err := message.NewSender(w.API).Reply(e, upd).Text(ctx, "⏳ Please wait, generating spectrogram..."); err == nil {
-				waitMessageID = sentMessageID(updates)
-			}
+	if updates, err := message.NewSender(w.API).Reply(e, upd).Text(ctx, "⏳ Please wait, generating spectrogram..."); err == nil {
+		waitMessageID = extractSentMessageID(updates)
+	}
+	defer func() {
+		if waitMessageID != 0 {
+			h.deleteMessageSafe(e, w, msg.PeerID, waitMessageID)
 		}
-	}
-
-	var fileName string
-	for _, attr := range targetDoc.Attributes {
-		if a, ok := attr.(*tg.DocumentAttributeFilename); ok {
-			fileName = a.FileName
-			break
-		}
-	}
-	if strings.TrimSpace(fileName) == "" {
-		fileName = "audio"
-	}
+	}()
 
 	analysisCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
-	audioPath := ""
-	spectrogramPath := ""
-	defer func() {
-		if audioPath != "" {
-			_ = os.Remove(audioPath)
-		}
-		if spectrogramPath != "" {
-			_ = os.Remove(spectrogramPath)
-		}
-	}()
-
-	if h.tgService != nil {
-		ext := strings.ToLower(filepath.Ext(fileName))
-		if ext == "" {
-			mime := strings.ToLower(targetDoc.MimeType)
-			switch {
-			case strings.Contains(mime, "flac"):
-				ext = ".flac"
-			case strings.Contains(mime, "mpeg") || strings.Contains(mime, "mp3"):
-				ext = ".mp3"
-			case strings.Contains(mime, "mp4") || strings.Contains(mime, "m4a"):
-				ext = ".m4a"
-			default:
-				ext = ".bin"
-			}
-		}
-		location := &tg.InputDocumentFileLocation{
-			ID:            targetDoc.ID,
-			AccessHash:    targetDoc.AccessHash,
-			FileReference: targetDoc.FileReference,
-		}
-		if tmp, err := os.CreateTemp("", "streamgo_spec_src_*"+ext); err == nil {
-			audioPath = tmp.Name()
-			dlErr := h.tgService.DownloadPartial(analysisCtx, location, 0, tmp)
-			_ = tmp.Close()
-			if dlErr != nil {
-				_ = os.Remove(audioPath)
-				audioPath = ""
-			}
-		}
-	}
-
-	if audioPath == "" {
+	audioPath, err := h.downloadDocumentToTemp(analysisCtx, targetDoc)
+	if err != nil {
 		_ = h.replyHTML(ctx, e, upd, "Unable to download the audio for the spectrogram.", nil)
-	} else if spec, err := os.CreateTemp("", "streamgo_spec_*.png"); err == nil {
-		spectrogramPath = spec.Name()
-		_ = spec.Close()
-		_ = os.Remove(spectrogramPath)
-		cmd := exec.CommandContext(analysisCtx, "sox", audioPath, "-n", "spectrogram", "-o", spectrogramPath)
-		if _, err := cmd.CombinedOutput(); err != nil {
-			_ = os.Remove(spectrogramPath)
-			spectrogramPath = ""
-		}
+		return
 	}
+	defer os.Remove(audioPath)
 
-	if spectrogramPath != "" {
-		if h.tgService != nil {
-			if w := h.tgService.PrimaryWorker(); w != nil && w.API != nil {
-				if uploaded, err := uploader.NewUploader(w.API).FromPath(analysisCtx, spectrogramPath); err == nil {
-					_, _ = message.NewSender(w.API).Reply(e, upd).UploadedPhoto(analysisCtx, uploaded)
-				} else {
-					_ = h.replyHTML(ctx, e, upd, "Unable to upload the spectrogram.", nil)
-				}
-			}
-		}
-	} else if audioPath != "" {
-		_ = h.replyHTML(ctx, e, upd, "Unable to generate spectrogram.", nil)
+	spectrogramPath, err := generateSpectrogramImage(analysisCtx, audioPath)
+	if err != nil {
+		_ = h.replyHTML(ctx, e, upd, "Unable to generate spectrogram. Make sure the file contains valid audio.", nil)
+		return
 	}
+	defer os.Remove(spectrogramPath)
 
-	if waitMessageID != 0 && h.tgService != nil {
-		if w := h.tgService.PrimaryWorker(); w != nil && w.API != nil {
-			deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer deleteCancel()
-			_, _ = w.API.MessagesDeleteMessages(deleteCtx, &tg.MessagesDeleteMessagesRequest{
-				ID:     []int{waitMessageID},
-				Revoke: true,
-			})
-		}
+	uploaded, err := uploader.NewUploader(w.API).FromPath(analysisCtx, spectrogramPath)
+	if err != nil {
+		_ = h.replyHTML(ctx, e, upd, "Unable to upload the spectrogram.", nil)
+		return
 	}
+	_, _ = message.NewSender(w.API).Reply(e, upd).UploadedPhoto(analysisCtx, uploaded)
 }
