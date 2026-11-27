@@ -264,6 +264,58 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		return
 	}
 
+	sentMessageID := func(update tg.UpdatesClass) int {
+		fromMessage := func(m tg.MessageClass) int {
+			if full, ok := m.(*tg.Message); ok {
+				return full.ID
+			}
+			return 0
+		}
+		fromUpdates := func(items []tg.UpdateClass) int {
+			for _, item := range items {
+				switch u := item.(type) {
+				case *tg.UpdateNewMessage:
+					if id := fromMessage(u.Message); id != 0 {
+						return id
+					}
+				case *tg.UpdateNewChannelMessage:
+					if id := fromMessage(u.Message); id != 0 {
+						return id
+					}
+				}
+			}
+			return 0
+		}
+
+		switch u := update.(type) {
+		case *tg.UpdateShortMessage:
+			return u.ID
+		case *tg.UpdateShortSentMessage:
+			return u.ID
+		case *tg.UpdateShort:
+			if nested, ok := u.Update.(*tg.UpdateNewMessage); ok {
+				return fromMessage(nested.Message)
+			}
+			if nested, ok := u.Update.(*tg.UpdateNewChannelMessage); ok {
+				return fromMessage(nested.Message)
+			}
+		case *tg.Updates:
+			return fromUpdates(u.Updates)
+		case *tg.UpdatesCombined:
+			return fromUpdates(u.Updates)
+		}
+		return 0
+	}
+
+	waitMessageID := 0
+	if h.tgService != nil {
+		if w := h.tgService.PrimaryWorker(); w != nil && w.API != nil {
+			if updates, err := message.NewSender(w.API).Reply(e, upd).Text(ctx, "⏳ Please wait, getting media information..."); err == nil {
+				waitMessageID = sentMessageID(updates)
+			}
+		}
+	}
+
 	var title, artist, fileName string
 	var duration int
 	for _, attr := range targetDoc.Attributes {
@@ -362,6 +414,17 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 			if uploaded, err := uploader.NewUploader(w.API).FromPath(analysisCtx, spectrogramPath); err == nil {
 				_, _ = message.NewSender(w.API).Reply(e, upd).UploadedPhoto(analysisCtx, uploaded)
 			}
+		}
+	}
+
+	if waitMessageID != 0 && h.tgService != nil {
+		if w := h.tgService.PrimaryWorker(); w != nil && w.API != nil {
+			deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer deleteCancel()
+			_, _ = w.API.MessagesDeleteMessages(deleteCtx, &tg.MessagesDeleteMessagesRequest{
+				ID:     []int{waitMessageID},
+				Revoke: true,
+			})
 		}
 	}
 }
