@@ -2,14 +2,11 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"html"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -267,54 +264,14 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		return
 	}
 
-	parseFloat := func(raw string) (float64, bool) {
-		s := strings.TrimSpace(strings.ReplaceAll(raw, ",", "."))
-		if s == "" {
-			return 0, false
-		}
-		v, err := strconv.ParseFloat(s, 64)
-		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
-			return 0, false
-		}
-		return v, true
-	}
-	fmtRate := func(v float64) string {
-		if v <= 0 {
-			return ""
-		}
-		if v >= 1_000_000 {
-			return fmt.Sprintf("%.2fm", v/1_000_000)
-		}
-		if v >= 1_000 {
-			return fmt.Sprintf("%.1fk", v/1_000)
-		}
-		return fmt.Sprintf("%.0f", v)
-	}
-	fmtSize := func(v float64) string {
-		if v >= 1024*1024 {
-			return fmt.Sprintf("%.1fm", v/(1024*1024))
-		}
-		if v >= 1024 {
-			return fmt.Sprintf("%.1fk", v/1024)
-		}
-		return fmt.Sprintf("%.0f", v)
-	}
-	fmtClock := func(sec float64) string {
-		total := int(math.Round(sec))
-		if total >= 3600 {
-			return fmt.Sprintf("%02d:%02d:%02d", total/3600, (total%3600)/60, total%60)
-		}
-		return fmt.Sprintf("%02d:%02d", total/60, total%60)
-	}
-
 	var title, artist, fileName string
-	var telegramDuration int
+	var duration int
 	for _, attr := range targetDoc.Attributes {
 		switch a := attr.(type) {
 		case *tg.DocumentAttributeAudio:
 			title = a.Title
 			artist = a.Performer
-			telegramDuration = a.Duration
+			duration = a.Duration
 		case *tg.DocumentAttributeFilename:
 			fileName = a.FileName
 		}
@@ -323,29 +280,11 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		fileName = "audio"
 	}
 
-	type ffprobeData struct {
-		Format struct {
-			Duration string            `json:"duration"`
-			BitRate  string            `json:"bit_rate"`
-			Size     string            `json:"size"`
-			Tags     map[string]string `json:"tags"`
-		} `json:"format"`
-		Streams []struct {
-			CodecName        string            `json:"codec_name"`
-			SampleRate       string            `json:"sample_rate"`
-			Channels         int               `json:"channels"`
-			BitsPerSample    int               `json:"bits_per_sample"`
-			BitsPerRawSample string            `json:"bits_per_raw_sample"`
-			Duration         string            `json:"duration"`
-			BitRate          string            `json:"bit_rate"`
-			Tags             map[string]string `json:"tags"`
-		} `json:"streams"`
-	}
-
 	analysisCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
 	audioPath := ""
+	spectrogramPath := ""
 	if h.tgService != nil {
 		ext := strings.ToLower(filepath.Ext(fileName))
 		if ext == "" {
@@ -375,49 +314,18 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 				audioPath = ""
 			}
 		}
-	}
-
-	var probe ffprobeData
-	if audioPath != "" {
-		if out, err := exec.CommandContext(analysisCtx, "ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", audioPath).Output(); err == nil {
-			_ = json.Unmarshal(out, &probe)
-		}
-	}
-
-	stats := map[string]float64{}
-	if audioPath != "" {
-		out, _ := exec.CommandContext(analysisCtx, "ffmpeg", "-hide_banner", "-nostats", "-i", audioPath,
-			"-af", "astats=metadata=1:reset=0,ametadata=mode=print", "-f", "null", "-").CombinedOutput()
-		for _, line := range strings.Split(string(out), "\n") {
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) != 2 {
-				continue
+		if audioPath != "" {
+			if spec, err := os.CreateTemp("", "streamgo_spec_*.png"); err == nil {
+				spectrogramPath = spec.Name()
+				_ = spec.Close()
+				_ = os.Remove(spectrogramPath)
+				cmd := exec.CommandContext(analysisCtx, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+					"-i", audioPath, "-lavfi", "showspectrumpic=s=1280x720:legend=1:mode=combined", spectrogramPath)
+				if _, err := cmd.CombinedOutput(); err != nil {
+					_ = os.Remove(spectrogramPath)
+					spectrogramPath = ""
+				}
 			}
-			key := strings.TrimSpace(parts[0])
-			if !strings.Contains(key, "lavfi.astats") {
-				continue
-			}
-			if value, ok := parseFloat(parts[1]); ok {
-				stats[key] = value
-			}
-		}
-	}
-
-	spectrogramPath := ""
-	spectrogramErr := error(nil)
-	if audioPath != "" {
-		if spec, err := os.CreateTemp("", "streamgo_spec_*.png"); err == nil {
-			spectrogramPath = spec.Name()
-			_ = spec.Close()
-			_ = os.Remove(spectrogramPath)
-			cmd := exec.CommandContext(analysisCtx, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-				"-i", audioPath, "-lavfi", "showspectrumpic=s=1280x720:legend=1:mode=combined", spectrogramPath)
-			if out, err := cmd.CombinedOutput(); err != nil {
-				spectrogramErr = fmt.Errorf("%s", strings.TrimSpace(string(out)))
-				spectrogramPath = ""
-			}
-		} else {
-			spectrogramErr = err
 		}
 	}
 	defer func() {
@@ -429,164 +337,22 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		}
 	}()
 
-	formatTags := probe.Format.Tags
-	if formatTags == nil {
-		formatTags = map[string]string{}
-	}
-	streamTags := map[string]string{}
-	if len(probe.Streams) > 0 && probe.Streams[0].Tags != nil {
-		streamTags = probe.Streams[0].Tags
-	}
-	tag := func(keys ...string) string {
-		for _, key := range keys {
-			if v := strings.TrimSpace(formatTags[key]); v != "" {
-				return v
-			}
-			if v := strings.TrimSpace(streamTags[key]); v != "" {
-				return v
-			}
-		}
-		return ""
-	}
-
-	lengthSeconds := float64(telegramDuration)
-	if v, ok := parseFloat(probe.Format.Duration); ok && v > 0 {
-		lengthSeconds = v
-	} else if len(probe.Streams) > 0 {
-		if v, ok := parseFloat(probe.Streams[0].Duration); ok && v > 0 {
-			lengthSeconds = v
-		}
-	}
-
-	bitRate := float64(0)
-	if v, ok := parseFloat(probe.Format.BitRate); ok {
-		bitRate = v
-	}
-	if bitRate == 0 && len(probe.Streams) > 0 {
-		if v, ok := parseFloat(probe.Streams[0].BitRate); ok {
-			bitRate = v
-		}
-	}
-
-	fileSize := float64(targetDoc.Size)
-	if v, ok := parseFloat(probe.Format.Size); ok && v > 0 {
-		fileSize = v
-	}
-
-	channels := 0
-	sampleRate := float64(0)
-	bits := 0
-	codec := ""
-	if len(probe.Streams) > 0 {
-		s := probe.Streams[0]
-		channels = s.Channels
-		codec = s.CodecName
-		if v, ok := parseFloat(s.SampleRate); ok {
-			sampleRate = v
-		}
-		bits = s.BitsPerSample
-		if v, ok := parseFloat(s.BitsPerRawSample); ok && v > 0 {
-			bits = int(v)
-		}
-	}
-
-	stat := func(scope, suffix string) (float64, bool) {
-		for key, value := range stats {
-			if strings.Contains(key, "."+scope+".") && strings.HasSuffix(key, "."+suffix) {
-				return value, true
-			}
-		}
-		return 0, false
-	}
-
+	sizeMB := float64(targetDoc.Size) / (1024 * 1024)
 	var sb strings.Builder
 	sb.WriteString("<b>Media Information:</b>\n\n")
-	sb.WriteString(fmt.Sprintf("Filename: <code>%s</code>\n", html.EscapeString(fileName)))
-	if lengthSeconds > 0 {
-		sb.WriteString(fmt.Sprintf("Duration: %s seconds\n", fmtClock(lengthSeconds)))
+	if title != "" {
+		sb.WriteString(fmt.Sprintf("• <b>Title:</b> %s\n", html.EscapeString(title)))
 	}
-	if bpm := tag("bpm", "tempo", "track_tempo"); bpm != "" {
-		sb.WriteString(fmt.Sprintf("BPM: %s\n", html.EscapeString(bpm)))
+	if artist != "" {
+		sb.WriteString(fmt.Sprintf("• <b>Artist:</b> %s\n", html.EscapeString(artist)))
 	}
-
-	album := tag("album")
-	albumArtist := tag("album_artist", "albumartist", "album artist")
-	artistValue := tag("artist", "performer")
-	if artistValue == "" {
-		artistValue = artist
+	if fileName != "" {
+		sb.WriteString(fmt.Sprintf("• <b>File:</b> <code>%s</code>\n", html.EscapeString(fileName)))
 	}
-	dateValue := tag("date", "year", "recorded_date")
-	titleValue := tag("title", "track_name")
-	if titleValue == "" {
-		titleValue = title
-	}
-
-	sb.WriteString("\n")
-	sb.WriteString(fmt.Sprintf("album: %s\n", html.EscapeString(album)))
-	sb.WriteString(fmt.Sprintf("albumartist: %s\n", html.EscapeString(albumArtist)))
-	sb.WriteString(fmt.Sprintf("artist: %s\n", html.EscapeString(artistValue)))
-	sb.WriteString(fmt.Sprintf("date: %s\n", html.EscapeString(dateValue)))
-	sb.WriteString(fmt.Sprintf("title: %s\n", html.EscapeString(titleValue)))
-
-	sb.WriteString("\n")
-	if rate := fmtRate(bitRate); rate != "" {
-		sb.WriteString(fmt.Sprintf("bitRate: %s\n", rate))
-	}
-	if channels > 0 {
-		sb.WriteString(fmt.Sprintf("channels: %d\n", channels))
-	}
-	sb.WriteString(fmt.Sprintf("comments: %s\n", html.EscapeString(tag("comment", "comments"))))
-	sb.WriteString(fmt.Sprintf("fileSize: %s\n", fmtSize(fileSize)))
-	if lengthSeconds > 0 {
-		sb.WriteString(fmt.Sprintf("lengthSeconds: %.6f\n", lengthSeconds))
-	}
-
-	putStat := func(label, scope, suffix string, digits int) {
-		if value, ok := stat(scope, suffix); ok {
-			sb.WriteString(fmt.Sprintf("%s: %.*f\n", label, digits, value))
-		}
-	}
-	putStat("maximumAmplitude", "Overall", "Max_level", 6)
-	putStat("maximumDelta", "Difference", "Max_level", 6)
-	putStat("meanAmplitude", "Overall", "Mean_level", 6)
-	putStat("meanDelta", "Difference", "Mean_level", 6)
-	putStat("meanNorm", "Overall", "Flat_factor", 6)
-	putStat("midlineAmplitude", "Overall", "DC_offset", 6)
-	putStat("minimumAmplitude", "Overall", "Min_level", 6)
-	putStat("minimumDelta", "Difference", "Min_level", 6)
-	putStat("rmsAmplitude", "Overall", "RMS_level", 6)
-	putStat("rmsDelta", "Difference", "RMS_level", 6)
-	putStat("roughFrequency", "Overall", "Zero_crossings_rate", 6)
-
-	if bits > 0 {
-		sb.WriteString(fmt.Sprintf("precision: %d-bit\n", bits))
-	}
-	if codec != "" {
-		if bits > 0 {
-			sb.WriteString(fmt.Sprintf("sampleEncoding: %d-bit %s\n", bits, html.EscapeString(codec)))
-		} else {
-			sb.WriteString(fmt.Sprintf("sampleEncoding: %s\n", html.EscapeString(codec)))
-		}
-	}
-	if sampleRate > 0 {
-		sb.WriteString(fmt.Sprintf("sampleRate: %.0f\n", sampleRate))
-	}
-	putStat("samplesRead", "Overall", "Number_of_samples", 0)
-	if v, ok := stat("Overall", "Scaled_by"); ok {
-		sb.WriteString(fmt.Sprintf("scaledBy: %.1f\n", v))
-	}
-	if v, ok := stat("Overall", "Volume_adjustment"); ok {
-		sb.WriteString(fmt.Sprintf("volumeAdjustment: %.3f\n", v))
-	}
-
-	if spectrogramPath == "" {
-		if spectrogramErr != nil {
-			sb.WriteString(fmt.Sprintf("\nspectrogram: unavailable (%s)\n", html.EscapeString(spectrogramErr.Error())))
-		} else {
-			sb.WriteString("\nspectrogram: unavailable\n")
-		}
-	} else {
-		sb.WriteString("\nspectrogram: attached below\n")
+	sb.WriteString(fmt.Sprintf("• <b>MIME:</b> <code>%s</code>\n", html.EscapeString(targetDoc.MimeType)))
+	sb.WriteString(fmt.Sprintf("• <b>Size:</b> %.2f MB\n", sizeMB))
+	if duration > 0 {
+		sb.WriteString(fmt.Sprintf("• <b>Duration:</b> %s\n", formatSeconds(int32(duration))))
 	}
 
 	_ = h.replyHTML(ctx, e, upd, sb.String(), nil)
