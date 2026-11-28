@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"html"
 	"math"
@@ -380,13 +381,35 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		return fmt.Sprintf("%.0f", v)
 	}
 
+	type ffprobeData struct {
+		Format struct {
+			Duration string            `json:"duration"`
+			BitRate  string            `json:"bit_rate"`
+			Size     string            `json:"size"`
+			Tags     map[string]string `json:"tags"`
+		} `json:"format"`
+		Streams []struct {
+			CodecName        string            `json:"codec_name"`
+			SampleRate       string            `json:"sample_rate"`
+			Channels         int               `json:"channels"`
+			BitsPerSample    int               `json:"bits_per_sample"`
+			BitsPerRawSample string            `json:"bits_per_raw_sample"`
+			Duration         string            `json:"duration"`
+			BitRate          string            `json:"bit_rate"`
+			Tags             map[string]string `json:"tags"`
+		} `json:"streams"`
+	}
+
 	audioPath := ""
 	defer func() {
 		if audioPath != "" {
 			_ = os.Remove(audioPath)
 		}
 	}()
-	if h.tgService != nil {
+	probeErr := ""
+	if h.tgService == nil {
+		probeErr = "Telegram service is unavailable."
+	} else {
 		ext := strings.ToLower(filepath.Ext(fileName))
 		if ext == "" {
 			mime := strings.ToLower(targetDoc.MimeType)
@@ -406,104 +429,39 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 			AccessHash:    targetDoc.AccessHash,
 			FileReference: targetDoc.FileReference,
 		}
-		if tmp, err := os.CreateTemp("", "streamgo_mi_*"+ext); err == nil {
+		if tmp, err := os.CreateTemp("", "streamgo_mi_*"+ext); err != nil {
+			probeErr = err.Error()
+		} else {
 			audioPath = tmp.Name()
-			dlErr := h.tgService.DownloadPartial(analysisCtx, location, 0, tmp)
+			dlErr := h.tgService.DownloadPartial(analysisCtx, location, 8<<20, tmp)
 			_ = tmp.Close()
 			if dlErr != nil {
 				_ = os.Remove(audioPath)
 				audioPath = ""
+				probeErr = dlErr.Error()
 			}
 		}
 	}
 
-	info := map[string]string{}
-	soxStats := map[string]float64{}
-	tags := map[string]string{}
+	var probe ffprobeData
 	if audioPath != "" {
-		parseComment := func(line string) {
-			line = strings.Trim(strings.TrimSpace(line), "'\"")
-			if line == "" {
-				return
-			}
-			if idx := strings.Index(line, "="); idx > 0 {
-				if key, value := strings.TrimSpace(line[:idx]), strings.TrimSpace(line[idx+1:]); key != "" && value != "" {
-					tags[normalizeKey(key)] = value
-					return
-				}
-			}
-			if idx := strings.Index(line, ":"); idx > 0 {
-				if key, value := strings.TrimSpace(line[:idx]), strings.TrimSpace(line[idx+1:]); key != "" && value != "" {
-					tags[normalizeKey(key)] = value
-					return
-				}
-			}
-			tags["comment"] = line
+		out, err := exec.CommandContext(analysisCtx, "ffprobe", "-v", "quiet", "-print_format", "json",
+			"-show_format", "-show_streams", "-show_chapters", audioPath).Output()
+		if err != nil {
+			probeErr = err.Error()
+		} else if err := json.Unmarshal(out, &probe); err != nil {
+			probeErr = err.Error()
 		}
-		knownInfoKeys := map[string]bool{
-			"inputfile": true, "channels": true, "samplerate": true, "precision": true,
-			"duration": true, "filesize": true, "bitrate": true, "sampleencoding": true,
-			"endiantype": true, "reversenibbles": true, "reversebits": true,
-			"replaygain": true, "leveladjust": true, "comment": true, "comments": true,
+	}
+
+	tags := map[string]string{}
+	for _, stream := range probe.Streams {
+		for key, value := range stream.Tags {
+			tags[key] = strings.TrimSpace(value)
 		}
-		if out, err := exec.CommandContext(analysisCtx, "sox", "--i", "-a", audioPath).CombinedOutput(); err == nil {
-			inComments := false
-			for _, raw := range strings.Split(string(out), "\n") {
-				line := strings.TrimSpace(raw)
-				if line == "" {
-					inComments = false
-					continue
-				}
-				if inComments {
-					if idx := strings.Index(line, ":"); idx >= 0 && !knownInfoKeys[normalizeKey(line[:idx])] {
-						parseComment(line)
-						continue
-					}
-					if strings.Contains(line, "=") {
-						parseComment(line)
-						continue
-					}
-					inComments = false
-				}
-				idx := strings.Index(line, ":")
-				if idx < 0 {
-					continue
-				}
-				key := normalizeKey(line[:idx])
-				value := strings.TrimSpace(line[idx+1:])
-				if key == "" {
-					continue
-				}
-				info[key] = value
-				switch key {
-				case "comments":
-					inComments = true
-					if value != "" {
-						parseComment(value)
-					}
-				case "comment":
-					parseComment(value)
-				}
-			}
-		}
-		if out, err := exec.CommandContext(analysisCtx, "sox", audioPath, "-n", "stat").CombinedOutput(); err == nil {
-			for _, line := range strings.Split(string(out), "\n") {
-				parts := strings.SplitN(line, ":", 2)
-				if len(parts) != 2 {
-					continue
-				}
-				key := normalizeKey(parts[0])
-				if key == "" {
-					continue
-				}
-				if _, exists := soxStats[key]; exists {
-					continue
-				}
-				if value, ok := parseFloat(parts[1]); ok {
-					soxStats[key] = value
-				}
-			}
-		}
+	}
+	for key, value := range probe.Format.Tags {
+		tags[key] = strings.TrimSpace(value)
 	}
 
 	tagKey := normalizeKey
@@ -523,51 +481,68 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 	}
 
 	lengthSeconds := float64(duration)
-	if v, ok := soxStats["lengthseconds"]; ok && v > 0 {
+	if v, ok := parseFloat(probe.Format.Duration); ok && v > 0 {
 		lengthSeconds = v
-	}
-	bitRateText := strings.TrimSpace(info["bitrate"])
-	if bitRateText == "" && lengthSeconds > 0 {
-		bitRateText = fmtRate(float64(targetDoc.Size) * 8 / lengthSeconds)
-	}
-	fileSizeText := strings.TrimSpace(info["filesize"])
-	if fileSizeText == "" {
-		fileSizeText = fmtSize(float64(targetDoc.Size))
-	}
-
-	metaTitle := tagValue("title")
-	metaAlbum := tagValue("album")
-	metaDate := tagValue("date", "year")
-	metaCopyright := tagValue("copyright")
-	metaBarcode := tagValue("barcode")
-	metaArtist := tagValue("artist")
-	metaAlbumArtist := tagValue("albumartist", "album artist", "album_artist")
-
-	if metaTitle == "" {
-		metaTitle = title
-	}
-	if metaArtist == "" {
-		metaArtist = artist
-	}
-
-	comments := tagValue("commenthttps", "commenthttpsurl", "comment url", "applemusicurl")
-	if comments == "" {
-		for key, value := range tags {
-			normalizedKey := tagKey(key)
-			lowerValue := strings.ToLower(value)
-			if strings.Contains(normalizedKey, "comment") &&
-				(strings.Contains(normalizedKey, "https") || strings.HasPrefix(lowerValue, "http") || strings.HasPrefix(lowerValue, "//")) {
-				comments = value
-				break
-			}
+	} else if len(probe.Streams) > 0 {
+		if v, ok := parseFloat(probe.Streams[0].Duration); ok && v > 0 {
+			lengthSeconds = v
 		}
 	}
 
-	bpm := ""
-	if rawBPM := tagValue("bpm", "tbpm"); rawBPM != "" {
-		if fields := strings.Fields(rawBPM); len(fields) > 0 {
-			if value, ok := parseFloat(fields[0]); ok && value > 0 {
-				bpm = fmt.Sprintf("%.0f", value)
+	bitRateText := ""
+	if v, ok := parseFloat(probe.Format.BitRate); ok && v > 0 {
+		bitRateText = fmtRate(v)
+	} else if len(probe.Streams) > 0 {
+		if v, ok := parseFloat(probe.Streams[0].BitRate); ok && v > 0 {
+			bitRateText = fmtRate(v)
+		}
+	}
+	if bitRateText == "" && lengthSeconds > 0 {
+		bitRateText = fmtRate(float64(targetDoc.Size) * 8 / lengthSeconds)
+	}
+
+	codecText := ""
+	sampleRateText := ""
+	channelsText := ""
+	bitDepthText := ""
+	if len(probe.Streams) > 0 {
+		stream := probe.Streams[0]
+		codecText = strings.TrimSpace(stream.CodecName)
+		sampleRateText = strings.TrimSpace(stream.SampleRate)
+		if stream.Channels > 0 {
+			channelsText = strconv.Itoa(stream.Channels)
+		}
+		if v, ok := parseFloat(stream.BitsPerRawSample); ok && v > 0 {
+			bitDepthText = fmt.Sprintf("%d-bit", int(v))
+		} else if stream.BitsPerSample > 0 {
+			bitDepthText = fmt.Sprintf("%d-bit", stream.BitsPerSample)
+		}
+	}
+
+	metaTitle := tagValue("title")
+	if metaTitle == "" {
+		metaTitle = title
+	}
+	metaArtist := tagValue("artist")
+	if metaArtist == "" {
+		metaArtist = artist
+	}
+	metaAlbum := tagValue("album")
+	metaAlbumArtist := tagValue("albumartist", "album artist", "album_artist")
+	metaDate := tagValue("date", "year")
+	metaGenre := tagValue("genre")
+	metaTrack := tagValue("track", "tracknumber")
+	metaDisc := tagValue("disc", "discnumber")
+	metaCopyright := tagValue("copyright")
+	metaBarcode := tagValue("barcode")
+	comments := tagValue("comment", "comments", "commenthttps", "commenthttpsurl", "applemusicurl")
+	if comments == "" {
+		for key, value := range tags {
+			lowerValue := strings.ToLower(value)
+			if strings.Contains(tagKey(key), "comment") &&
+				(strings.HasPrefix(lowerValue, "http") || strings.HasPrefix(lowerValue, "//")) {
+				comments = value
+				break
 			}
 		}
 	}
@@ -582,59 +557,43 @@ func (h *Handler) handleMediaInfo(ctx context.Context, e tg.Entities, upd messag
 		sb.WriteString(label + ": <b>" + html.EscapeString(value) + "</b>\n")
 	}
 
-	writeLine("Filename", fileName)
-	durationText := ""
-	if lengthSeconds > 0 {
-		roundedSeconds := int(math.Round(lengthSeconds))
-		durationText = fmt.Sprintf("%02d:%02d seconds", roundedSeconds/60, roundedSeconds%60)
-	}
-	writeLine("Duration", durationText)
-	writeLine("BPM", bpm)
-
-	sb.WriteString("\n")
-	writeLine("title", metaTitle)
-	writeLine("album", metaAlbum)
-	writeLine("date", metaDate)
-	writeLine("copyright", metaCopyright)
-	writeLine("barcode", metaBarcode)
-	writeLine("artist", metaArtist)
-	writeLine("albumartist", metaAlbumArtist)
-
-	sb.WriteString("\n")
-	writeLine("bitRate", bitRateText)
-	writeLine("channels", strings.TrimSpace(info["channels"]))
-	writeLine("comments", comments)
-	writeLine("fileSize", fileSizeText)
-	writeLine("lengthSeconds", fmt.Sprintf("%.6f", lengthSeconds))
-
-	putSoxStat := func(label, key string, digits int) {
-		valueText := ""
-		if value, ok := soxStats[key]; ok {
-			valueText = fmt.Sprintf("%.*f", digits, value)
+	replyText := ""
+	if probeErr != "" {
+		replyText = "Unable to read media information."
+		if detail := strings.Join(strings.Fields(probeErr), " "); detail != "" {
+			replyText += "\n<code>" + html.EscapeString(detail) + "</code>"
 		}
-		writeLine(label, valueText)
+	} else {
+		durationText := ""
+		if lengthSeconds > 0 {
+			roundedSeconds := int(math.Round(lengthSeconds))
+			durationText = fmt.Sprintf("%02d:%02d seconds", roundedSeconds/60, roundedSeconds%60)
+		}
+		writeLine("Filename", fileName)
+		writeLine("Codec", codecText)
+		writeLine("Duration", durationText)
+		writeLine("Bitrate", bitRateText)
+		writeLine("Sample Rate", sampleRateText)
+		writeLine("Channels", channelsText)
+		writeLine("Bit Depth", bitDepthText)
+		writeLine("File Size", fmtSize(float64(targetDoc.Size)))
+
+		sb.WriteString("\n")
+		writeLine("Title", metaTitle)
+		writeLine("Artist", metaArtist)
+		writeLine("Album", metaAlbum)
+		writeLine("Album Artist", metaAlbumArtist)
+		writeLine("Date", metaDate)
+		writeLine("Genre", metaGenre)
+		writeLine("Track", metaTrack)
+		writeLine("Disc", metaDisc)
+		writeLine("Copyright", metaCopyright)
+		writeLine("Barcode", metaBarcode)
+		writeLine("Comment", comments)
+		replyText = sb.String()
 	}
 
-	putSoxStat("maximumAmplitude", "maximumamplitude", 6)
-	putSoxStat("maximumDelta", "maximumdelta", 6)
-	putSoxStat("meanAmplitude", "meanamplitude", 6)
-	putSoxStat("meanDelta", "meandelta", 6)
-	putSoxStat("meanNorm", "meannorm", 6)
-	putSoxStat("midlineAmplitude", "midlineamplitude", 6)
-	putSoxStat("minimumAmplitude", "minimumamplitude", 6)
-	putSoxStat("minimumDelta", "minimumdelta", 6)
-	putSoxStat("rmsAmplitude", "rmsamplitude", 6)
-	putSoxStat("rmsDelta", "rmsdelta", 6)
-	putSoxStat("roughFrequency", "roughfrequency", 0)
-
-	writeLine("precision", strings.TrimSpace(info["precision"]))
-	writeLine("sampleEncoding", strings.TrimSpace(info["sampleencoding"]))
-	writeLine("sampleRate", strings.TrimSpace(info["samplerate"]))
-	putSoxStat("samplesRead", "samplesread", 0)
-	putSoxStat("scaledBy", "scaledby", 1)
-	putSoxStat("volumeAdjustment", "volumeadjustment", 3)
-
-	_ = h.replyHTML(ctx, e, upd, sb.String(), nil)
+	_ = h.replyHTML(ctx, e, upd, replyText, nil)
 
 	if waitMessageID != 0 && h.tgService != nil {
 		if w := h.tgService.PrimaryWorker(); w != nil && w.API != nil {
