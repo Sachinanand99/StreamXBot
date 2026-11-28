@@ -13,7 +13,7 @@ StreamXBot's Go version, called StreamGO. The previous Python source is on [`leg
 
 ## Run locally
 
-You need Go 1.25 or newer, MongoDB, FFmpeg, and MediaInfo.
+You need Go 1.25 or newer, MongoDB, FFmpeg, SoX and MediaInfo.
 
 ```sh
 cp .env.example .env

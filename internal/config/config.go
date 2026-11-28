@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -47,6 +48,32 @@ type Config struct {
 	GuestPassword            string
 	AlacCacheMaxBytes        int64
 	AlacCacheMaxFiles        int
+
+	// Listen Together / party server
+	PartyMaxMembers              int
+	PartyStateHeartbeatMS        int
+	PartyPlayLeadMS              int
+	PartyDisconnectGraceMS       int64
+	PartyEmptyTTLMS              int64
+	PartyMaxAgeMS                int64
+	PartyControlRatePerSecond    int
+	PartyFrameRatePerSecond      int
+	PartyMaxUpcomingQueue        int
+	PartyMaxQueueLength          int
+	PartyMaxParties              int
+	PartyCreateRatePerMinute     int
+	PartyRateLimitMaxEntries     int
+	PartyRequestMaxBytes         int64
+	PartyWebSocketMaxBytes       int64
+	PartyConnectionIdleMS        int64
+	PartyAllowedOrigins          []string
+	PartyTrustProxy              bool
+	PartyPublicOrigin            string
+	PartyPresenceIntervalSec     int
+	PartyPresenceGraceSec        int
+	PartyPresenceMaxEntries      int
+	PartyPresencePingsPerMinute  int
+	PartyPresenceRateLimitMaxIPs int
 
 	// Cloudflare R2 / S3 Blob Storage (Optional)
 	R2AccountID       string
@@ -105,6 +132,10 @@ func Load() *Config {
 	}
 	sudoUsers := parseIDList(os.Getenv("SUDO_USERS"))
 
+	partyMaxUpcomingQueue := getEnvInt("JAM_MAX_UPCOMING_QUEUE", 25)
+	partyMaxQueueLength := getEnvInt("JAM_MAX_QUEUE_LENGTH", 1+partyMaxUpcomingQueue)
+	partyAllowedOrigins := parseStringList(getEnv("JAM_ALLOWED_ORIGINS", ""))
+
 	return &Config{
 		Port:                     getEnv("PORT", "8000"),
 		Debug:                    debug,
@@ -139,17 +170,67 @@ func Load() *Config {
 		GuestPassword:            getEnv("GUEST_PASSWORD", ""),
 		AlacCacheMaxBytes:        getEnvInt64("ALAC_CACHE_MAX_BYTES", 5*1024*1024*1024),
 		AlacCacheMaxFiles:        getEnvInt("ALAC_CACHE_MAX_FILES", 200),
-		R2AccountID:              getEnv("R2_ACCOUNT_ID", ""),
-		R2AccessKeyID:            getEnv("R2_ACCESS_KEY_ID", ""),
-		R2SecretAccessKey:        getEnv("R2_SECRET_ACCESS_KEY", ""),
-		R2BucketName:             getEnv("R2_BUCKET_NAME", ""),
-		R2PublicURL:              strings.TrimRight(getEnv("R2_PUBLIC_URL", ""), "/"),
+
+		PartyMaxMembers:              getEnvInt("JAM_MAX_MEMBERS", 5),
+		PartyStateHeartbeatMS:        getEnvInt("JAM_STATE_HEARTBEAT_MS", 5000),
+		PartyPlayLeadMS:              getEnvInt("JAM_PLAY_LEAD_MS", 350),
+		PartyDisconnectGraceMS:       getEnvInt64("JAM_DISCONNECT_GRACE_MS", 45000),
+		PartyEmptyTTLMS:              getEnvInt64("JAM_EMPTY_PARTY_TTL_MS", 120000),
+		PartyMaxAgeMS:                getEnvInt64("JAM_PARTY_MAX_AGE_MS", 12*60*60*1000),
+		PartyControlRatePerSecond:    getEnvInt("JAM_CONTROL_RATE_PER_SECOND", 25),
+		PartyFrameRatePerSecond:      getEnvInt("JAM_FRAME_RATE_PER_SECOND", 30),
+		PartyMaxUpcomingQueue:        partyMaxUpcomingQueue,
+		PartyMaxQueueLength:          partyMaxQueueLength,
+		PartyMaxParties:              getEnvInt("JAM_MAX_PARTIES", 50),
+		PartyCreateRatePerMinute:     getEnvInt("JAM_CREATE_RATE_PER_MINUTE", 2),
+		PartyRateLimitMaxEntries:     getEnvInt("JAM_RATE_LIMIT_MAX_ENTRIES", 10000),
+		PartyRequestMaxBytes:         getEnvInt64("JAM_REQUEST_MAX_BYTES", 16*1024),
+		PartyWebSocketMaxBytes:       getEnvInt64("JAM_WEBSOCKET_MAX_BYTES", 16*1024),
+		PartyConnectionIdleMS:        getEnvInt64("JAM_CONNECTION_IDLE_MS", 15*60*1000),
+		PartyAllowedOrigins:          partyAllowedOrigins,
+		PartyTrustProxy:              getEnvBool("JAM_TRUST_PROXY", false),
+		PartyPublicOrigin:            getPartyOrigin(getEnv("JAM_PUBLIC_ORIGIN", "")),
+		PartyPresenceIntervalSec:     getEnvInt("JAM_PRESENCE_INTERVAL_SEC", 300),
+		PartyPresenceGraceSec:        getEnvInt("JAM_PRESENCE_GRACE_SEC", 90),
+		PartyPresenceMaxEntries:      getEnvInt("JAM_PRESENCE_MAX_ENTRIES", 200000),
+		PartyPresencePingsPerMinute:  getEnvInt("JAM_PRESENCE_PINGS_PER_MINUTE", 20),
+		PartyPresenceRateLimitMaxIPs: getEnvInt("JAM_PRESENCE_RATE_LIMIT_MAX_IPS", 100000),
+
+		R2AccountID:       getEnv("R2_ACCOUNT_ID", ""),
+		R2AccessKeyID:     getEnv("R2_ACCESS_KEY_ID", ""),
+		R2SecretAccessKey: getEnv("R2_SECRET_ACCESS_KEY", ""),
+		R2BucketName:      getEnv("R2_BUCKET_NAME", ""),
+		R2PublicURL:       strings.TrimRight(getEnv("R2_PUBLIC_URL", ""), "/"),
 	}
 }
 
 // HasR2 returns true if all necessary Cloudflare R2 credentials are provided.
 func (c *Config) HasR2() bool {
 	return c.R2AccountID != "" && c.R2AccessKeyID != "" && c.R2SecretAccessKey != "" && c.R2BucketName != ""
+}
+
+func parseStringList(raw string) []string {
+	var values []string
+	for _, item := range strings.Split(raw, ",") {
+		if value := strings.TrimSpace(item); value != "" {
+			values = append(values, value)
+		}
+	}
+	return values
+}
+
+func getPartyOrigin(raw string) string {
+	value := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if value == "" {
+		return ""
+	}
+	u, err := url.Parse(value)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+		u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		log.Warnf("ignoring invalid JAM_PUBLIC_ORIGIN %q", value)
+		return ""
+	}
+	return value
 }
 
 func parseIDList(raw string) []int64 {

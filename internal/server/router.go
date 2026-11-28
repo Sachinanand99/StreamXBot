@@ -83,6 +83,14 @@ func New(cfg *config.Config, db *database.Client, tg *telegram.Service, filter *
 	r.Head("/", s.handleIndex)
 	r.Get("/health", s.handleHealth)
 
+	// Listen Together / party server (wire-compatible with StreamX clients).
+	// This is in-memory and does not depend on MongoDB.
+	partySvc := services.NewPartyService(cfg)
+	partyHandler := handlers.NewPartyHandler(partySvc, cfg)
+	partyHandler.Routes(r)
+	go partySvc.StartHeartbeat(context.Background())
+	go partySvc.StartSweeper(context.Background())
+
 	// API Documentation Routes (Swagger UI & ReDoc)
 	r.Get("/docs", s.handleDocs)
 	r.Get("/docs/*", s.handleDocs)

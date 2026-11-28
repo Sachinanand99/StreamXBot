@@ -62,6 +62,9 @@ func isReservedNavigation(path string) bool {
 		path == "/openapi.json" ||
 		strings.HasPrefix(path, "/assets/") ||
 		strings.HasPrefix(path, "/auth/") ||
+		path == "/healthz" ||
+		path == "/invite" || strings.HasPrefix(path, "/invite/") ||
+		path == "/ws" || strings.HasPrefix(path, "/ws/") ||
 		strings.HasPrefix(path, "/covers/") ||
 		strings.HasPrefix(path, "/stream/") ||
 		strings.HasPrefix(path, "/download/") ||
@@ -95,6 +98,9 @@ func isAPIOrReservedPath(path string) bool {
 		"/sources",
 		"/discord",
 		"/health",
+		"/healthz",
+		"/ws",
+		"/invite",
 		"/docs",
 		"/redoc",
 		"/openapi.json",
